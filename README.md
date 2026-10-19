@@ -12,6 +12,7 @@
 
 - **Collage layouts**: Random grid-based collages (single full-screen, two stacked, big + small tiles) with smooth cross-fades
 - **Smart object-fit**: Images use full-bleed `cover` in multi-tile layouts and fall back to `contain` (letterbox) when cropping would be too severe
+- **Face-aware cropping**: Detects faces and positions each crop so they stay in view. People who appear often in your library are found automatically and kept on screen first; when nothing fits, the photo is letterboxed instead of cutting a face
 - **Video support**: Plays MP4 clips inline, with configurable max file size
 - **HEIC/HEIF support**: Processes Apple HEIC photos automatically via pillow-heif
 - **Image caching**: EXIF-corrected, resized to 1080x1920, compressed JPEG cache for instant loads
@@ -87,6 +88,14 @@ Uploaded images are pre-cached in a background thread so they display immediatel
 
 **Status lines**: Up to 3 status lines per frame, showing any HA sensor value (temperature, energy, occupancy, etc.). If a label is not set, the entity's `friendly_name` is used.
 
+## Face-Aware Cropping
+
+A background worker scans the image cache every few minutes. For each photo it records the faces it finds (YuNet detector) and a fingerprint of each face (SFace), stored as a `.faces.json` file beside the cached image. Small or unsure faces, such as people in the background, are ignored.
+
+Faces that recur across the library are grouped automatically; anyone seen in at least `FAVORITE_MIN_PHOTOS` photos counts as a frequent face. When a collage tile crops a photo, the crop is positioned to keep every clear face in view, then just the frequent faces if they all cannot fit, and falls back to showing the whole photo with bars.
+
+The first scan of a large library takes a few minutes; photos without face data are center-cropped until then. Only one worker runs per cache directory, even with several containers sharing `./cache`. Face data never leaves the cache directory. Set `ENABLE_FACES=0` to turn it off.
+
 ## Multi-Frame Setup
 
 Run multiple frames from a single container by accessing different `/frame/<name>` URLs, or run separate containers on different ports:
@@ -127,6 +136,10 @@ Each frame reads media from `MEDIA_BASE/<frame-name>/` (e.g. `/media/smartframes
 | `MAX_VIDEO_MB` | `12` | Maximum MP4 file size in MB (larger files are skipped) |
 | `ENABLE_VIDEOS` | `1` | Set to `0` to exclude all MP4 files |
 | `ENABLE_HEIC` | `1` | Set to `0` to disable HEIC/HEIF support |
+| `ENABLE_FACES` | `1` | Set to `0` to disable face-aware cropping |
+| `FAVORITE_MIN_PHOTOS` | `15` | Photos a person must appear in to count as a frequent face |
+| `FACE_SCAN_INTERVAL` | `300` | Seconds between face scans for new photos |
+| `FACE_MODEL_DIR` | `/models` | Directory holding the face models (baked into the image) |
 | `MAX_UPLOAD_MB` | `200` | Maximum upload size in MB |
 | `UPLOAD_AUTH_ENABLED` | `0` | Set to `1` to require HTTP Basic auth on upload |
 | `UPLOAD_USERNAME` | *(none)* | Upload auth username (required when auth is on) |
@@ -140,6 +153,7 @@ app/
 ├── config.py       # All environment variable configuration
 ├── weather.py      # Open-Meteo weather fetching & 10-min cache
 ├── media.py        # Media listing, image caching/resizing, HEIC support
+├── faces.py        # Face detection, frequent-face clustering, background worker
 ├── ha.py           # Home Assistant helpers (motion, status, parallel fetch)
 ├── upload.py       # Upload blueprint (dedup, ZIP, optional auth)
 ├── routes.py       # Main routes blueprint (frame, img, media, motion, etc.)
