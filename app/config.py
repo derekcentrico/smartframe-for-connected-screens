@@ -56,6 +56,14 @@ ENABLE_VIDEOS = os.environ.get("ENABLE_VIDEOS", "1") == "1"
 ENABLE_HEIC = os.environ.get("ENABLE_HEIC", "1") == "1"
 
 # ---------------------
+# Face-aware cropping
+# ---------------------
+ENABLE_FACES = os.environ.get("ENABLE_FACES", "1") == "1"
+FACE_MODEL_DIR = os.environ.get("FACE_MODEL_DIR", "/models")
+FACE_SCAN_INTERVAL = max(30, _safe_int("FACE_SCAN_INTERVAL", 300))
+FAVORITE_MIN_PHOTOS = max(2, _safe_int("FAVORITE_MIN_PHOTOS", 15))
+
+# ---------------------
 # Upload
 # ---------------------
 UPLOAD_AUTH_ENABLED = os.environ.get("UPLOAD_AUTH_ENABLED", "0") == "1"

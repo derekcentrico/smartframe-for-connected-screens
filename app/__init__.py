@@ -45,4 +45,9 @@ def create_app():
     app.register_blueprint(upload_bp)
     app.register_blueprint(routes_bp)
 
+    from .faces import start_worker
+    from .media import IMAGE_EXTS, get_cached_image
+
+    start_worker(get_cached_image, IMAGE_EXTS)
+
     return app

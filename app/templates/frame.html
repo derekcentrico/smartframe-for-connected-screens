@@ -232,6 +232,9 @@
   var SLIDE_INTERVAL = {{ slide_interval }};
   var STATUS_ITEMS   = {{ status_items|tojson }};
   var FRAME_NAME     = {{ frame_name|tojson }};
+  // url -> {a: box of all clear faces, f: box of frequent faces or null},
+  // boxes as normalised [x, y, w, h]
+  var FOCUS          = {{ focus|tojson }};
 
   var currentIndex         = 0;
   var slideshowTimer       = null;
@@ -267,6 +270,7 @@
             currentIndex = 0;
           }
         } catch (e) { /* ignore parse error */ }
+        refreshFocus();
         hadServerError = false;
         recoveryInProgress = false;
         setReconnectBadgeVisible(false);
@@ -323,32 +327,74 @@
     }
   ];
 
-  function adjustImageObjectFit(img, isSingleLayout) {
-    if (!isSingleLayout) {
-      img.style.objectFit = "cover";
-      return;
+  function refreshFocus() {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/focus_map/" + encodeURIComponent(FRAME_NAME), true);
+    xhr.timeout = 10000;
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== 4 || xhr.status !== 200) return;
+      try {
+        var data = JSON.parse(xhr.responseText);
+        if (data && typeof data === "object") FOCUS = data;
+      } catch (e) { /* keep the previous map */ }
+    };
+    xhr.send(null);
+  }
+
+  function boxFits(box, vw, vh) {
+    return box && box[2] <= vw + 0.001 && box[3] <= vh + 0.001;
+  }
+
+  // object-position that centres box inside the visible window of a cover
+  // crop. vw/vh are the visible fraction of the image on each axis.
+  function coverPosition(box, vw, vh) {
+    var px = 50, py = 50;
+    if (vw < 0.999) {
+      var left = Math.min(Math.max(box[0] + box[2] / 2 - vw / 2, 0), 1 - vw);
+      px = left / (1 - vw) * 100;
     }
-    if (!img || !img.parentNode) {
-      img.style.objectFit = "cover";
-      return;
+    if (vh < 0.999) {
+      var top = Math.min(Math.max(box[1] + box[3] / 2 - vh / 2, 0), 1 - vh);
+      py = top / (1 - vh) * 100;
     }
+    return px.toFixed(1) + "% " + py.toFixed(1) + "%";
+  }
+
+  // Must run once the tile is in the document; a detached tile measures 0x0.
+  function fitImage(img, isSingleLayout) {
+    img.style.objectFit = "cover";
+    img.style.objectPosition = "50% 50%";
     var tile = img.parentNode;
+    if (!tile) return;
     var rect = tile.getBoundingClientRect();
-    if (!rect.width || !rect.height ||
-        !img.naturalWidth || !img.naturalHeight) {
-      img.style.objectFit = "cover";
-      return;
+    var iw = img.naturalWidth, ih = img.naturalHeight;
+    if (!rect.width || !rect.height || !iw || !ih) return;
+
+    if (isSingleLayout) {
+      var tileAR = rect.width / rect.height;
+      var imgAR  = iw / ih;
+      var ratio = (imgAR > tileAR) ? (imgAR / tileAR) : (tileAR / imgAR);
+      // Aspect ratios differ by > ~35%: show the full image with bars.
+      if (ratio > 1.35) {
+        img.style.objectFit = "contain";
+        return;
+      }
     }
-    var tileAR = rect.width / rect.height;
-    var imgAR  = img.naturalWidth / img.naturalHeight;
 
-    var ratio = (imgAR > tileAR) ? (imgAR / tileAR) : (tileAR / imgAR);
+    var focus = FOCUS[img.getAttribute("data-src")];
+    if (!focus) return;
+    var scale = Math.max(rect.width / iw, rect.height / ih);
+    var vw = rect.width / (iw * scale);
+    var vh = rect.height / (ih * scale);
 
-    // Threshold: if aspect ratios differ by > ~35%, show full image with bars.
-    if (ratio > 1.35) {
-      img.style.objectFit = "contain";
+    // Prefer every clear face; settle for the frequent ones; otherwise
+    // letterbox rather than cut a face.
+    var target = boxFits(focus.a, vw, vh) ? focus.a
+               : (boxFits(focus.f, vw, vh) ? focus.f : null);
+    if (target) {
+      img.style.objectPosition = coverPosition(target, vw, vh);
     } else {
-      img.style.objectFit = "cover";
+      img.style.objectFit = "contain";
     }
   }
 
@@ -399,6 +445,9 @@
       collage.style.gridTemplateAreas   = tempContainer.style.gridTemplateAreas;
       while (tempContainer.firstChild) collage.appendChild(tempContainer.firstChild);
 
+      var imgs = collage.getElementsByTagName("img");
+      for (var k = 0; k < imgs.length; k++) fitImage(imgs[k], isSingleLayout);
+
       if (firstImageForBg && bg) {
         bg.style.backgroundImage = "url('" + firstImageForBg + "')";
         lastGoodBgImage = bg.style.backgroundImage;
@@ -438,9 +487,9 @@
         })(tile);
       } else {
         el = document.createElement("img");
-        (function(imgRef, singleLayout, tileRef){
+        el.setAttribute("data-src", file);
+        (function(imgRef, tileRef){
           imgRef.onload = function() {
-            adjustImageObjectFit(imgRef, singleLayout);
             loadedCount++;
             checkAllLoaded();
           };
@@ -449,7 +498,7 @@
             failedCount++;
             checkAllLoaded();
           };
-        })(el, isSingleLayout, tile);
+        })(el, tile);
         el.src = file;
         if (!firstImageForBg) firstImageForBg = file;
       }
@@ -669,6 +718,8 @@
     startStatusPolling();
     startMotionPolling();
     startWeatherPolling();
+    // New uploads get face boxes within a scan interval; pick them up.
+    setInterval(refreshFocus, 600000);
   };
 </script>
 </body>

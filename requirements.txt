@@ -3,3 +3,4 @@ requests>=2.31
 pillow>=10.0
 gunicorn>=21.0
 pillow-heif>=0.13
+opencv-python-headless>=4.8

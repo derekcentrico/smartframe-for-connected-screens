@@ -5,11 +5,13 @@ Media listing, image caching / resizing, and HEIC support.
 import logging
 import os
 import random
+import tempfile
 import time
 
 from PIL import Image, ImageOps
 
 from .config import CACHE_BASE, ENABLE_HEIC, ENABLE_VIDEOS, MAX_VIDEO_MB, MEDIA_BASE
+from .faces import favorites_snapshot, focus_for_cache
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,8 @@ if ENABLE_HEIC:
         HEIC_SUPPORTED = False
         logger.warning("pillow-heif not installed; HEIC files will be skipped")
 
+IMAGE_EXTS = (".jpg", ".jpeg", ".png") + ((".heic", ".heif") if HEIC_SUPPORTED else ())
+
 # ---------------------
 # Ensure cache dir exists
 # ---------------------
@@ -41,20 +45,25 @@ if not os.path.isdir(CACHE_BASE):
 # ---------------------
 
 
-def _safe_cache_path(frame_name: str, rel_path: str) -> str:
+def _cache_path(frame_name: str, rel_path: str) -> str:
     """Return full path to cached image for a given frame and relative source path."""
     cache_dir = os.path.join(
         CACHE_BASE, frame_name.lower(), os.path.dirname(rel_path)
     )
+    base, _ext = os.path.splitext(os.path.basename(rel_path))
+    return os.path.join(cache_dir, base + "_1080x1920.jpg")
+
+
+def _safe_cache_path(frame_name: str, rel_path: str) -> str:
+    """Like _cache_path, but create the cache subdirectory if needed."""
+    path = _cache_path(frame_name, rel_path)
+    cache_dir = os.path.dirname(path)
     if not os.path.isdir(cache_dir):
         try:
             os.makedirs(cache_dir, exist_ok=True)
         except OSError:
             logger.warning("Could not create cache subdirectory %s", cache_dir)
-
-    base, _ext = os.path.splitext(os.path.basename(rel_path))
-    cache_filename = base + "_1080x1920.jpg"
-    return os.path.join(cache_dir, cache_filename)
+    return path
 
 
 def get_cached_image(frame_name: str, full_src_path: str, rel_path: str):
@@ -78,7 +87,20 @@ def get_cached_image(frame_name: str, full_src_path: str, rel_path: str):
         im = ImageOps.exif_transpose(im)
         im = im.convert("RGB")
         im.thumbnail((1080, 1920), Image.LANCZOS)
-        im.save(cache_path, "JPEG", quality=72, optimize=True, progressive=True)
+        # Write then rename: the face worker and request threads both build
+        # cache images, and a reader must never see a half-written JPEG.
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cache_path), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                im.save(fh, "JPEG", quality=72, optimize=True, progressive=True)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, cache_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return cache_path
     except Exception:
         logger.warning("Failed to cache image %s", full_src_path, exc_info=True)
@@ -126,10 +148,7 @@ def list_media(frame_name: str):
         random.shuffle(result)
         return result
 
-    image_exts = [".jpg", ".jpeg", ".png"]
-    if HEIC_SUPPORTED:
-        image_exts.extend([".heic", ".heif"])
-    image_exts = tuple(image_exts)
+    image_exts = IMAGE_EXTS
     video_exts = (".mp4",)
     max_video_bytes = MAX_VIDEO_MB * 1024 * 1024
 
@@ -166,3 +185,18 @@ def list_media(frame_name: str):
 
     random.shuffle(files)
     return files
+
+
+def focus_map(frame_name: str) -> dict:
+    """Map each image URL for a frame to its face focus boxes, where known."""
+    key = frame_name.lower()
+    prefix = f"/img/{key}/"
+    out = {}
+    favorites = favorites_snapshot()
+    for url in list_media(frame_name):
+        if not url.startswith(prefix):
+            continue
+        focus = focus_for_cache(_cache_path(key, url[len(prefix):]), favorites)
+        if focus:
+            out[url] = focus
+    return out

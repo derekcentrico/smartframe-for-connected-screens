@@ -10,7 +10,7 @@ from werkzeug.security import safe_join
 
 from .config import CACHE_BASE, MEDIA_BASE, SLIDE_INTERVAL
 from .ha import fetch_ha_status, fetch_motion_state
-from .media import get_cached_image, list_media
+from .media import focus_map, get_cached_image, list_media
 from .weather import fetch_weather
 
 routes_bp = Blueprint("routes", __name__)
@@ -46,6 +46,7 @@ def frame(frame_name):
         slide_interval=SLIDE_INTERVAL,
         weather=weather,
         status_items=status_items,
+        focus=focus_map(frame_name),
     )
 
 
@@ -104,6 +105,14 @@ def media_list(frame_name):
     if not _SAFE_FRAME_RE.match(frame_name):
         abort(400)
     return jsonify(list_media(frame_name))
+
+
+@routes_bp.route("/focus_map/<frame_name>")
+def focus_map_api(frame_name):
+    """Return face focus boxes keyed by image URL."""
+    if not _SAFE_FRAME_RE.match(frame_name):
+        abort(400)
+    return jsonify(focus_map(frame_name))
 
 
 @routes_bp.route("/health")
