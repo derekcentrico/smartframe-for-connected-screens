@@ -1,0 +1,675 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ frame_name|e }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      width: 100%;
+      background: #000;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      transition: opacity 0.8s ease-in-out;
+    }
+    body.dimmed {
+      opacity: 0;
+    }
+    #root {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      color: #fff;
+    }
+
+    #bg {
+      position: absolute;
+      top: -10%;
+      left: -10%;
+      right: -10%;
+      bottom: -10%;
+      background-position: center center;
+      background-size: cover;
+      filter: blur(18px);
+      transform: scale(1.1);
+      opacity: 0.30;
+      z-index: 0;
+    }
+
+    #collage {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: grid;
+      grid-template-rows: 1fr;
+      grid-template-columns: 1fr;
+      gap: 6px;
+      padding: 16px;
+      box-sizing: border-box;
+      z-index: 1;
+      box-shadow: 0 0 18px rgba(0, 0, 0, 0.55);
+      border-radius: 4px;
+    }
+
+    #collage .tile {
+      overflow: hidden;
+      border-radius: 4px;
+      position: relative;
+      background: rgba(0, 0, 0, 0.85);
+    }
+
+    #collage img,
+    #collage video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      background: #000;
+    }
+
+    /* Time, weather, status overlay */
+    #overlay {
+      position: absolute;
+      right: 20px;
+      top: 20px;
+      z-index: 2;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 10px 14px;
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      font-size: 14px;
+      line-height: 1.3;
+      min-width: 220px;
+    }
+
+    /* Top row: time/date on left, weather on right */
+    #overlay-top {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      justify-content: space-between;
+      width: 100%;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+
+    #overlay-clock-block {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .time {
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .date {
+      font-size: 13px;
+      opacity: 0.8;
+    }
+
+    #overlay-weather-block {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+    .weather-line {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 14px;
+    }
+    .weather-icon {
+      font-size: 18px;
+    }
+    .temps {
+      font-size: 14px;
+    }
+    .weather-desc {
+      font-size: 12px;
+      opacity: 0.9;
+      margin-top: 2px;
+    }
+
+    #status-lines {
+      margin-top: 4px;
+      width: 100%;
+    }
+    .status-line {
+      font-size: 12px;
+      opacity: 0.95;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .status-label {
+      font-weight: 600;
+      margin-right: 4px;
+    }
+
+    /* Reconnecting badge */
+    #reconnect-badge {
+      margin-top: 6px;
+      font-size: 11px;
+      color: #ffb3b3;
+      opacity: 0.9;
+      padding: 2px 6px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 179, 179, 0.5);
+      background: rgba(0, 0, 0, 0.6);
+      display: none;
+    }
+
+    .fade-in {
+      animation: fadein 1s ease-out;
+    }
+    @keyframes fadein {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div id="bg"></div>
+    <div id="collage"></div>
+    <div id="overlay">
+      <div id="overlay-top">
+        <div id="overlay-clock-block">
+          <div class="time" id="clock">--:--</div>
+          <div class="date" id="date">--</div>
+        </div>
+        {% if weather %}
+        <div id="overlay-weather-block">
+          <div class="weather-line">
+            <span class="weather-icon" id="weather-icon">{{ weather.icon }}</span>
+            <span class="temps" id="weather-temps">
+              {% if weather.temp_f is not none %}
+                {{ "%.0f" % weather.temp_f }}&deg;F /
+              {% endif %}
+              {% if weather.temp_c is not none %}
+                {{ "%.0f" % weather.temp_c }}&deg;C
+              {% endif %}
+            </span>
+          </div>
+          <div class="weather-desc" id="weather-desc">{{ weather.description }}</div>
+        </div>
+        {% else %}
+        <div id="overlay-weather-block" style="display:none;">
+          <div class="weather-line">
+            <span class="weather-icon" id="weather-icon"></span>
+            <span class="temps" id="weather-temps"></span>
+          </div>
+          <div class="weather-desc" id="weather-desc"></div>
+        </div>
+        {% endif %}
+      </div>
+      <div id="status-lines">
+        {% for item in status_items %}
+        <div class="status-line">
+          <span class="status-label">{{ item.label|e }}</span>
+          <span class="status-value">{{ item.value|e }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      <div id="reconnect-badge">Reconnecting&hellip;</div>
+    </div>
+  </div>
+
+<script>
+  // ES5 only
+
+  var ALL_FILES      = {{ files|tojson }};
+  var SLIDE_INTERVAL = {{ slide_interval }};
+  var STATUS_ITEMS   = {{ status_items|tojson }};
+  var FRAME_NAME     = {{ frame_name|tojson }};
+
+  var currentIndex         = 0;
+  var slideshowTimer       = null;
+  var PAUSED               = false;
+  var hadServerError       = false;
+  var recoveryInProgress   = false;
+
+  function setReconnectBadgeVisible(visible) {
+    var b = document.getElementById("reconnect-badge");
+    if (!b) return;
+    b.style.display = visible ? "block" : "none";
+  }
+
+  function markServerError() {
+    hadServerError = true;
+    setReconnectBadgeVisible(true);
+  }
+
+  function maybeReloadOnRecovery() {
+    if (!hadServerError || recoveryInProgress) return;
+    recoveryInProgress = true;
+    // Soft recovery: fetch updated media list instead of hard reload
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/media_list/" + encodeURIComponent(FRAME_NAME), true);
+    xhr.timeout = 10000;
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== 4) return;
+      if (xhr.status === 200) {
+        try {
+          var data = JSON.parse(xhr.responseText);
+          if (data && data.length) {
+            ALL_FILES = data;
+            currentIndex = 0;
+          }
+        } catch (e) { /* ignore parse error */ }
+        hadServerError = false;
+        recoveryInProgress = false;
+        setReconnectBadgeVisible(false);
+        buildCollage();
+      } else {
+        // Still failing, allow retry on next poll success
+        recoveryInProgress = false;
+      }
+    };
+    xhr.onerror = xhr.ontimeout = function() {
+      recoveryInProgress = false;
+    };
+    xhr.send(null);
+  }
+
+  function isVideo(path) {
+    var p = path.toLowerCase();
+    return p.lastIndexOf(".mp4") === p.length - 4;
+  }
+
+  function nextFile() {
+    if (!ALL_FILES.length) return null;
+    var f = ALL_FILES[currentIndex];
+    currentIndex = (currentIndex + 1) % ALL_FILES.length;
+    return f;
+  }
+
+  // Layout set:
+  //   - Single full-screen
+  //   - Two stacked portrait tiles
+  //   - Big top + three small bottom
+  //   - Big left + two stacked right
+  var LAYOUTS = [
+    // Single full-screen (weighted twice)
+    { rows: "1fr", cols: "1fr", areas: [["a"]], tiles: ["a"] },
+    { rows: "1fr", cols: "1fr", areas: [["a"]], tiles: ["a"] },
+
+    // Two stacked (top/bottom)
+    { rows: "1fr 1fr", cols: "1fr", areas: [["a"],["b"]], tiles: ["a","b"] },
+    { rows: "1fr 1fr", cols: "1fr", areas: [["a"],["b"]], tiles: ["a","b"] },
+
+    // Big top, three small bottom
+    {
+      rows: "2fr 1fr", cols: "1fr 1fr 1fr",
+      areas: [["a","a","a"],["b","c","d"]],
+      tiles: ["a","b","c","d"]
+    },
+
+    // Big left, two stacked right
+    {
+      rows: "1fr 1fr", cols: "2fr 1fr",
+      areas: [["a","b"],["a","c"]],
+      tiles: ["a","b","c"]
+    }
+  ];
+
+  function adjustImageObjectFit(img, isSingleLayout) {
+    if (!isSingleLayout) {
+      img.style.objectFit = "cover";
+      return;
+    }
+    if (!img || !img.parentNode) {
+      img.style.objectFit = "cover";
+      return;
+    }
+    var tile = img.parentNode;
+    var rect = tile.getBoundingClientRect();
+    if (!rect.width || !rect.height ||
+        !img.naturalWidth || !img.naturalHeight) {
+      img.style.objectFit = "cover";
+      return;
+    }
+    var tileAR = rect.width / rect.height;
+    var imgAR  = img.naturalWidth / img.naturalHeight;
+
+    var ratio = (imgAR > tileAR) ? (imgAR / tileAR) : (tileAR / imgAR);
+
+    // Threshold: if aspect ratios differ by > ~35%, show full image with bars.
+    if (ratio > 1.35) {
+      img.style.objectFit = "contain";
+    } else {
+      img.style.objectFit = "cover";
+    }
+  }
+
+  // Snapshot of last successfully rendered collage HTML + bg image
+  var lastGoodCollageHTML = "";
+  var lastGoodBgImage    = "";
+
+  function buildCollage() {
+    var collage = document.getElementById("collage");
+    var bg      = document.getElementById("bg");
+
+    if (!ALL_FILES.length) {
+      collage.innerHTML = "<div style='color:white;text-align:center;margin-top:40%;font-size:20px;'>No media found</div>";
+      if (bg) bg.style.backgroundImage = "none";
+      return;
+    }
+
+    var layout = LAYOUTS[Math.floor(Math.random() * LAYOUTS.length)];
+    var isSingleLayout = (layout.tiles.length === 1);
+
+    // Build new collage in a detached container so we can verify loads before swapping
+    var tempContainer = document.createElement("div");
+
+    tempContainer.style.gridTemplateRows    = layout.rows;
+    tempContainer.style.gridTemplateColumns = layout.cols;
+    var rowsCss = [];
+    for (var r = 0; r < layout.areas.length; r++) {
+      rowsCss.push("'" + layout.areas[r].join(" ") + "'");
+    }
+    tempContainer.style.gridTemplateAreas = rowsCss.join(" ");
+
+    var firstImageForBg = null;
+    var totalTiles  = layout.tiles.length;
+    var loadedCount = 0;
+    var failedCount = 0;
+
+    function checkAllLoaded() {
+      if (loadedCount + failedCount < totalTiles) return;
+      if (failedCount === totalTiles) {
+        // All tiles failed, keep showing last-good content
+        markServerError();
+        return;
+      }
+      // At least some tiles loaded, swap in the new collage
+      while (collage.firstChild) collage.removeChild(collage.firstChild);
+      collage.style.gridTemplateRows    = tempContainer.style.gridTemplateRows;
+      collage.style.gridTemplateColumns = tempContainer.style.gridTemplateColumns;
+      collage.style.gridTemplateAreas   = tempContainer.style.gridTemplateAreas;
+      while (tempContainer.firstChild) collage.appendChild(tempContainer.firstChild);
+
+      if (firstImageForBg && bg) {
+        bg.style.backgroundImage = "url('" + firstImageForBg + "')";
+        lastGoodBgImage = bg.style.backgroundImage;
+      }
+      lastGoodCollageHTML = collage.innerHTML;
+    }
+
+    for (var i = 0; i < layout.tiles.length; i++) {
+      var areaName = layout.tiles[i];
+      var file     = nextFile();
+      if (!file) { failedCount++; continue; }
+
+      var tile = document.createElement("div");
+      tile.className = "tile fade-in";
+      tile.style.gridArea = areaName;
+
+      var el;
+      if (isVideo(file)) {
+        el = document.createElement("video");
+        el.autoplay = true;
+        el.loop     = true;
+        el.muted    = true;
+        if (isSingleLayout) {
+          el.style.objectFit = "contain";
+        } else {
+          el.style.objectFit = "cover";
+        }
+        el.src = file;
+        // Videos: count as loaded once metadata arrives
+        (function(tileRef) {
+          el.onloadeddata = function() { loadedCount++; checkAllLoaded(); };
+          el.onerror = function() {
+            tileRef.style.display = "none";
+            failedCount++;
+            checkAllLoaded();
+          };
+        })(tile);
+      } else {
+        el = document.createElement("img");
+        (function(imgRef, singleLayout, tileRef){
+          imgRef.onload = function() {
+            adjustImageObjectFit(imgRef, singleLayout);
+            loadedCount++;
+            checkAllLoaded();
+          };
+          imgRef.onerror = function() {
+            tileRef.style.display = "none";
+            failedCount++;
+            checkAllLoaded();
+          };
+        })(el, isSingleLayout, tile);
+        el.src = file;
+        if (!firstImageForBg) firstImageForBg = file;
+      }
+
+      tile.appendChild(el);
+      tempContainer.appendChild(tile);
+    }
+  }
+
+  function startSlideshow() {
+    if (!ALL_FILES.length) {
+      buildCollage();
+      return;
+    }
+    buildCollage();
+    slideshowTimer = setInterval(function() {
+      if (!PAUSED) {
+        buildCollage();
+      }
+    }, SLIDE_INTERVAL * 1000);
+  }
+
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+  function formatTime12h(d) {
+    var h = d.getHours();
+    var m = d.getMinutes();
+    var ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    return h + ":" + pad2(m) + " " + ampm;
+  }
+
+  function formatDate(d) {
+    var months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    var days   = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+    return days[d.getDay()] + ", " + months[d.getMonth()] + " " + d.getDate() + ", " + d.getFullYear();
+  }
+
+  function startClock() {
+    function tick() {
+      var now    = new Date();
+      var clockEl = document.getElementById("clock");
+      var dateEl  = document.getElementById("date");
+      if (clockEl) clockEl.innerHTML = formatTime12h(now);
+      if (dateEl)  dateEl.innerHTML  = formatDate(now);
+    }
+    tick();
+    setInterval(tick, 1000);
+  }
+
+  function updateStatusLines(items) {
+    var container = document.getElementById("status-lines");
+    if (!container) return;
+    container.innerHTML = "";
+    for (var i = 0; i < items.length; i++) {
+      var line = document.createElement("div");
+      line.className = "status-line";
+      var labelSpan = document.createElement("span");
+      labelSpan.className = "status-label";
+      labelSpan.appendChild(document.createTextNode(items[i].label + ":"));
+      var valueSpan = document.createElement("span");
+      valueSpan.className = "status-value";
+      valueSpan.appendChild(document.createTextNode(" " + items[i].value));
+      line.appendChild(labelSpan);
+      line.appendChild(valueSpan);
+      container.appendChild(line);
+    }
+  }
+
+  // ---- XHR helper with timeout and retry + exponential backoff ----
+  function xhrWithRetry(url, opts) {
+    // opts: { timeout, maxRetries, onSuccess(responseText), onFail() }
+    var timeout    = opts.timeout    || 8000;
+    var maxRetries = opts.maxRetries || 3;
+    var onSuccess  = opts.onSuccess  || function() {};
+    var onFail     = opts.onFail     || function() {};
+
+    var attempt = 0;
+
+    function doAttempt() {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", url, true);
+      xhr.timeout = timeout;
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status === 200) {
+          onSuccess(xhr.responseText);
+        } else {
+          retry();
+        }
+      };
+      xhr.onerror = function() { retry(); };
+      xhr.ontimeout = function() { retry(); };
+      xhr.send(null);
+    }
+
+    function retry() {
+      attempt++;
+      if (attempt >= maxRetries) {
+        onFail();
+        return;
+      }
+      // Exponential backoff: 2s, 4s, 8s
+      var delay = Math.pow(2, attempt) * 1000;
+      setTimeout(doAttempt, delay);
+    }
+
+    doAttempt();
+  }
+
+  function startStatusPolling() {
+    updateStatusLines(STATUS_ITEMS || []);
+    if (!FRAME_NAME) return;
+
+    function pollStatus() {
+      xhrWithRetry("/ha_status/" + encodeURIComponent(FRAME_NAME), {
+        timeout: 8000,
+        maxRetries: 3,
+        onSuccess: function(text) {
+          try {
+            var data = JSON.parse(text);
+            updateStatusLines(data);
+          } catch (e) { /* ignore parse error */ }
+          maybeReloadOnRecovery();
+        },
+        onFail: function() {
+          markServerError();
+        }
+      });
+    }
+
+    pollStatus();
+    setInterval(pollStatus, 120000); // every 2 minutes
+  }
+
+  function startMotionPolling() {
+    if (!FRAME_NAME) return;
+    var body = document.body;
+
+    function pollMotion() {
+      xhrWithRetry("/motion/" + encodeURIComponent(FRAME_NAME), {
+        timeout: 8000,
+        maxRetries: 3,
+        onSuccess: function(text) {
+          try {
+            var data = JSON.parse(text);
+            var st = String(data.state || "").toLowerCase();
+
+            if (st === "off" || st === "unavailable") {
+              if (body.className.indexOf("dimmed") === -1) {
+                body.className = (body.className + " dimmed").trim();
+              }
+              PAUSED = true;
+            } else {
+              body.className = body.className.split("dimmed").join("").trim();
+              PAUSED = false;
+            }
+          } catch (e) { /* parsing problem, but still a successful roundtrip */ }
+          maybeReloadOnRecovery();
+        },
+        onFail: function() {
+          markServerError();
+        }
+      });
+    }
+
+    pollMotion();
+    setInterval(pollMotion, 10000); // every 10s
+  }
+
+  function updateWeatherDOM(w) {
+    if (!w || !w.icon) return;
+    var block = document.getElementById("overlay-weather-block");
+    var iconEl = document.getElementById("weather-icon");
+    var tempsEl = document.getElementById("weather-temps");
+    var descEl = document.getElementById("weather-desc");
+    if (!block) return;
+
+    block.style.display = "";
+    if (iconEl) iconEl.textContent = w.icon || "";
+
+    var tempStr = "";
+    if (w.temp_f !== null && w.temp_f !== undefined) {
+      tempStr += Math.round(w.temp_f) + "\u00b0F / ";
+    }
+    if (w.temp_c !== null && w.temp_c !== undefined) {
+      tempStr += Math.round(w.temp_c) + "\u00b0C";
+    }
+    if (tempsEl) tempsEl.textContent = tempStr;
+    if (descEl) descEl.textContent = w.description || "";
+  }
+
+  function startWeatherPolling() {
+    function pollWeather() {
+      xhrWithRetry("/weather", {
+        timeout: 10000,
+        maxRetries: 2,
+        onSuccess: function(text) {
+          try {
+            var data = JSON.parse(text);
+            updateWeatherDOM(data);
+          } catch (e) { /* ignore */ }
+        },
+        onFail: function() { /* weather is non-critical, silent fail */ }
+      });
+    }
+
+    pollWeather();
+    // Poll every 10 minutes
+    setInterval(pollWeather, 600000);
+  }
+
+  window.onload = function() {
+    startClock();
+    startSlideshow();
+    startStatusPolling();
+    startMotionPolling();
+    startWeatherPolling();
+  };
+</script>
+</body>
+</html>

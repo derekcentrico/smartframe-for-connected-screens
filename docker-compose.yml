@@ -1,0 +1,42 @@
+services:
+  smartframe_upstairs:
+    build: .
+    container_name: smartframe_upstairs
+    restart: unless-stopped
+    ports:
+      - "8383:8383"
+    env_file: .env
+    volumes:
+      - /media/smartframes:/media/smartframes:rw
+      - ./cache:/cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8383/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  smartframe_basement:
+    build: .
+    container_name: smartframe_basement
+    restart: unless-stopped
+    ports:
+      - "8384:8383"
+    env_file: .env
+    volumes:
+      - /media/smartframes:/media/smartframes:rw
+      - ./cache:/cache
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8383/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"

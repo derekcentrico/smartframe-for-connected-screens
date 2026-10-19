@@ -1,0 +1,231 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SmartFrame Upload</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+      color: #fff;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 20px;
+    }
+    .card {
+      background: #1e1e1e;
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      max-width: 480px;
+      margin: 0 auto;
+    }
+    label, select, input, button, p, small {
+      font-size: 14px;
+    }
+    select, input[type=file], button {
+      width: 100%;
+      margin-top: 6px;
+    }
+    button {
+      margin-top: 12px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: none;
+      background: #2f80ed;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .message {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #c0ffc0;
+    }
+    .error {
+      color: #ffb3b3;
+    }
+    .tip {
+      margin-top: 12px;
+      font-size: 12px;
+      color: #ccc;
+    }
+    /* Progress bar */
+    #progress-wrap {
+      display: none;
+      margin-top: 12px;
+    }
+    #progress-bar-bg {
+      width: 100%;
+      height: 22px;
+      background: #333;
+      border-radius: 11px;
+      overflow: hidden;
+    }
+    #progress-bar {
+      height: 100%;
+      width: 0%;
+      background: #2f80ed;
+      border-radius: 11px;
+      transition: width 0.2s ease;
+    }
+    #progress-text {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #aaa;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Upload to SmartFrame</h1>
+
+    <form id="upload-form" method="post" enctype="multipart/form-data">
+      {% if not default_frame %}
+        <label for="frame">Send to which frame?</label>
+        <select id="frame" name="frame">
+          <option value="_all">All frames</option>
+          {% for f in frames %}
+            <option value="{{ f|e }}">{{ f|e }}</option>
+          {% endfor %}
+        </select>
+      {% else %}
+        <p>Uploading to frame: <strong>{{ default_frame|e }}</strong></p>
+        <input type="hidden" id="frame" name="frame" value="{{ default_frame|e }}">
+      {% endif %}
+
+      <label for="files" style="margin-top:10px;">Choose photos, videos, or ZIP archives</label>
+      <input id="files" type="file" name="files" multiple accept="image/*,video/mp4,.zip">
+
+      <button type="submit" id="upload-btn">Upload</button>
+    </form>
+
+    <div id="progress-wrap">
+      <div id="progress-bar-bg"><div id="progress-bar"></div></div>
+      <div id="progress-text"></div>
+    </div>
+
+    <p id="message" class="message" style="display:none;"></p>
+
+    {% if message %}
+      <p class="message{% if is_error %} error{% endif %}">{{ message|e }}</p>
+    {% endif %}
+
+    <p class="tip">
+      Tip: On Android, open this page in Chrome on your home Wi-Fi.
+      When you tap "Choose files", you can pick items from Google Photos,
+      your Gallery, or Files. After upload, the new photos will appear
+      in the SmartFrame slideshow automatically.
+    </p>
+  </div>
+
+<script>
+(function() {
+  var form       = document.getElementById("upload-form");
+  var filesInput = document.getElementById("files");
+  var btn        = document.getElementById("upload-btn");
+  var progWrap   = document.getElementById("progress-wrap");
+  var progBar    = document.getElementById("progress-bar");
+  var progText   = document.getElementById("progress-text");
+  var msgEl      = document.getElementById("message");
+
+  var MAX_RETRIES = 3;
+
+  function showMessage(text, isError) {
+    msgEl.textContent = text;
+    msgEl.className = "message" + (isError ? " error" : "");
+    msgEl.style.display = "block";
+  }
+
+  function setProgress(pct, label) {
+    progWrap.style.display = "block";
+    progBar.style.width = Math.min(pct, 100) + "%";
+    progText.textContent = label || "";
+  }
+
+  function doUpload(formData, attempt) {
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", form.action || window.location.href, true);
+    xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+
+    xhr.upload.onprogress = function(e) {
+      if (e.lengthComputable) {
+        var pct = Math.round(e.loaded / e.total * 100);
+        setProgress(pct, "Uploading\u2026 " + pct + "%");
+      }
+    };
+
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== 4) return;
+
+      if (xhr.status === 200 || xhr.status === 400) {
+        try {
+          var data = JSON.parse(xhr.responseText);
+          showMessage(data.message || "Upload complete.", !!data.error);
+        } catch (e) {
+          showMessage("Upload complete.", false);
+        }
+        setProgress(100, "Done");
+        btn.disabled = false;
+        btn.textContent = "Upload";
+      } else {
+        retryOrFail(formData, attempt, "Server returned status " + xhr.status);
+      }
+    };
+
+    xhr.onerror = function() {
+      retryOrFail(formData, attempt, "Network error");
+    };
+
+    xhr.ontimeout = function() {
+      retryOrFail(formData, attempt, "Request timed out");
+    };
+
+    // 5 minute timeout for large uploads
+    xhr.timeout = 300000;
+    xhr.send(formData);
+  }
+
+  function retryOrFail(formData, attempt, reason) {
+    if (attempt < MAX_RETRIES) {
+      var delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+      setProgress(0, reason + " \u2014 retrying in " + (delay / 1000) + "s\u2026 (attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
+      setTimeout(function() { doUpload(formData, attempt + 1); }, delay);
+    } else {
+      showMessage(reason + ". Upload failed after " + MAX_RETRIES + " attempts.", true);
+      setProgress(0, "Failed");
+      progWrap.style.display = "none";
+      btn.disabled = false;
+      btn.textContent = "Upload";
+    }
+  }
+
+  form.onsubmit = function(e) {
+    e.preventDefault();
+
+    if (!filesInput.files || !filesInput.files.length) {
+      showMessage("Please select at least one file.", true);
+      return;
+    }
+
+    msgEl.style.display = "none";
+    btn.disabled = true;
+    btn.textContent = "Uploading\u2026";
+
+    var formData = new FormData(form);
+    setProgress(0, "Starting upload\u2026");
+    doUpload(formData, 0);
+  };
+})();
+</script>
+</body>
+</html>
