@@ -9,7 +9,7 @@ import time
 
 from PIL import Image, ImageOps
 
-from .config import CACHE_BASE, MEDIA_BASE, MAX_VIDEO_MB, ENABLE_VIDEOS, ENABLE_HEIC
+from .config import CACHE_BASE, ENABLE_HEIC, ENABLE_VIDEOS, MAX_VIDEO_MB, MEDIA_BASE
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +103,7 @@ def _folder_max_mtime(folder: str) -> float:
         for name in filenames:
             try:
                 mt = os.path.getmtime(os.path.join(root, name))
-                if mt > max_mt:
-                    max_mt = mt
+                max_mt = max(max_mt, mt)
             except OSError:
                 pass
     return max_mt
@@ -144,7 +143,7 @@ def list_media(frame_name: str):
             rel_url_path = rel_path.replace("\\", "/")
 
             if lower.endswith(image_exts):
-                url = "/img/%s/%s" % (key, rel_url_path)
+                url = f"/img/{key}/{rel_url_path}"
                 files.append(url)
                 continue
 
@@ -155,7 +154,7 @@ def list_media(frame_name: str):
                     continue
                 if size > max_video_bytes:
                     continue
-                url = "/media/%s/%s" % (key, rel_url_path)
+                url = f"/media/{key}/{rel_url_path}"
                 files.append(url)
                 continue
 

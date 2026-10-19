@@ -5,13 +5,13 @@ Main Flask routes: frame display, media serving, motion, HA status, health, weat
 import os
 import re
 
-from flask import Blueprint, render_template, send_from_directory, abort, jsonify
+from flask import Blueprint, abort, jsonify, render_template, send_from_directory
 from werkzeug.security import safe_join
 
-from .config import MEDIA_BASE, CACHE_BASE, SLIDE_INTERVAL
+from .config import CACHE_BASE, MEDIA_BASE, SLIDE_INTERVAL
+from .ha import fetch_ha_status, fetch_motion_state
+from .media import get_cached_image, list_media
 from .weather import fetch_weather
-from .media import list_media, get_cached_image
-from .ha import fetch_motion_state, fetch_ha_status
 
 routes_bp = Blueprint("routes", __name__)
 
