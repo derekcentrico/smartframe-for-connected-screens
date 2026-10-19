@@ -9,8 +9,8 @@ from flask import Flask
 from .config import (
     MAX_UPLOAD_MB,
     UPLOAD_AUTH_ENABLED,
-    UPLOAD_USERNAME,
     UPLOAD_PASSWORD,
+    UPLOAD_USERNAME,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,8 +39,8 @@ def create_app():
     app = Flask(__name__, template_folder="templates")
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
-    from .upload import upload_bp
     from .routes import routes_bp
+    from .upload import upload_bp
 
     app.register_blueprint(upload_bp)
     app.register_blueprint(routes_bp)

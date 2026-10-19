@@ -15,16 +15,16 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 
-from flask import Blueprint, jsonify, render_template, request, Response
+from flask import Blueprint, Response, jsonify, render_template, request
 from werkzeug.utils import secure_filename
 
 from .config import (
     MEDIA_BASE,
     UPLOAD_AUTH_ENABLED,
-    UPLOAD_USERNAME,
     UPLOAD_PASSWORD,
+    UPLOAD_USERNAME,
 )
-from .media import get_cached_image, invalidate_media_cache, HEIC_SUPPORTED
+from .media import HEIC_SUPPORTED, get_cached_image, invalidate_media_cache
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +184,7 @@ def _save_file(data: bytes, filename: str, target_dir: str,
         existing_hashes.add(h)
     except OSError as exc:
         if exc.errno == errno.ENOSPC:
-            logger.error("Disk full writing %s", dest_path, exc_info=True)
+            logger.exception("Disk full writing %s", dest_path)
         else:
             logger.warning("Failed to write uploaded file %s", dest_path, exc_info=True)
         return "unsupported"

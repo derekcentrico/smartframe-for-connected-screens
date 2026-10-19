@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-from .config import HA_URL, HA_TOKEN
+from .config import HA_TOKEN, HA_URL
 
 logger = logging.getLogger(__name__)
 

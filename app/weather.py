@@ -7,7 +7,7 @@ import time
 
 import requests
 
-from .config import WEATHER_LAT, WEATHER_LON, WEATHER_TZ, WEATHER_OFFSET_C
+from .config import WEATHER_LAT, WEATHER_LON, WEATHER_OFFSET_C, WEATHER_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +16,6 @@ _weather_cache: dict = {"timestamp": 0, "data": None}
 
 def fetch_weather():
     """Fetch current weather from Open-Meteo and cache it (10 min)."""
-    global _weather_cache
-
     if not WEATHER_LAT or not WEATHER_LON:
         return None
 
