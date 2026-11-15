@@ -225,7 +225,6 @@
     </div>
   </div>
 
-<script src="{{ url_for('static', filename='collage.js') }}"></script>
 <script>
   // ES5 only
 
@@ -236,6 +235,7 @@
   // url -> {a: box of all clear faces, f: box of frequent faces or null},
   // boxes as normalised [x, y, w, h]
   var FOCUS          = {{ focus|tojson }};
+  var COLLAGE_JS     = {{ url_for('static', filename='collage.js')|tojson }};
 
   var currentIndex         = 0;
   var slideshowTimer       = null;
@@ -326,6 +326,7 @@
   var pool            = [];  // {url, video, el, w, h, ready, done, timer}
   var poolGen         = 0;   // bumped on reset; stale callbacks compare against it
   var poolWaiters     = [];
+  var lateWaiter      = null;  // build past its deadline, waiting on any one load
   var building        = false;
   var lastLayoutName  = null;
 
@@ -386,6 +387,12 @@
       entry.ready = true;
       entry.w = w;
       entry.h = h;
+      if (lateWaiter) {
+        var late = lateWaiter;
+        lateWaiter = null;
+        late();
+        return;
+      }
     } else {
       for (var i = 0; i < pool.length; i++) {
         if (pool[i] === entry) { pool.splice(i, 1); break; }
@@ -447,6 +454,7 @@
     }
     pool = [];
     poolWaiters = [];
+    lateWaiter = null;
     building = false;
   }
 
@@ -459,10 +467,53 @@
     tile.style.background = clear;
   }
 
+  var collageScriptEl    = null;
+  var collageScriptSince = 0;
+
+  function dropCollageScript() {
+    var s = collageScriptEl;
+    collageScriptEl = null;
+    if (!s) return;
+    s.onload = s.onerror = null;
+    if (s.parentNode) s.parentNode.removeChild(s);
+  }
+
+  function watchCollageScript(s) {
+    collageScriptEl = s;
+    collageScriptSince = new Date().getTime();
+    s.onload = s.onerror = function() {
+      if (s !== collageScriptEl) return;
+      dropCollageScript();
+      if (window.SmartFrameCollage && !PAUSED) buildCollage();
+    };
+  }
+
+  // Requested from onload rather than a script tag, so a stalled request can
+  // neither block the page nor hold back the load event.
+  function requestCollageScript(bust) {
+    dropCollageScript();
+    var s = document.createElement("script");
+    s.src = bust ? COLLAGE_JS + (COLLAGE_JS.indexOf("?") === -1 ? "?" : "&") + "r=" + new Date().getTime()
+                 : COLLAGE_JS;
+    watchCollageScript(s);
+    document.getElementsByTagName("head")[0].appendChild(s);
+  }
+
+  // A request that failed, or stalled past the timeout, is replaced; the pool
+  // waits for the next tick.
+  function collageModule() {
+    if (window.SmartFrameCollage) return window.SmartFrameCollage;
+    if (collageScriptEl && new Date().getTime() - collageScriptSince < LOAD_TIMEOUT_MS) return null;
+    markServerError();
+    requestCollageScript(true);
+    return null;
+  }
+
   function renderFromPool() {
     var collage = document.getElementById("collage");
     var bg      = document.getElementById("bg");
-    var Collage = window.SmartFrameCollage;
+    var Collage = collageModule();
+    if (!Collage) return;
 
     var ready = [];
     for (var i = 0; i < pool.length; i++) {
@@ -564,13 +615,21 @@
       if (started || gen !== poolGen) return;
       started = true;
       building = false;
+      lateWaiter = null;
+      // Paused while loading: keep the pool for the first build after resume.
+      if (PAUSED) return;
       renderFromPool();
       // Load the next collage's media during this one's display time.
       fillPool(null);
     }
     fillPool(go);
-    // A stalled request must not hold back media that is already loaded.
-    setTimeout(function() { if (poolHasReady()) go(); }, BUILD_WAIT_MS);
+    // A stalled request must not hold back media that is already loaded, or
+    // the first item to finish after the deadline.
+    setTimeout(function() {
+      if (started || gen !== poolGen) return;
+      if (poolHasReady()) go();
+      else lateWaiter = go;
+    }, BUILD_WAIT_MS);
   }
 
   function startSlideshow() {
@@ -779,6 +838,7 @@
 
   window.onload = function() {
     startClock();
+    requestCollageScript(false);
     startSlideshow();
     startStatusPolling();
     startMotionPolling();
