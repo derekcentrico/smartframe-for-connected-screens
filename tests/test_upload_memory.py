@@ -29,7 +29,7 @@ def clean_dirs(monkeypatch: pytest.MonkeyPatch):
         if "smartframe-test-" not in d:
             pytest.fail(f"refusing to clear {d}: not the test scratch directory")
         shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d)
+        os.makedirs(d, exist_ok=True)  # a late background job may have recreated it
     media._media_cache.clear()
     upload._hash_cache.clear()
     monkeypatch.setattr(faces, "ENABLE_FACES", False)
@@ -329,11 +329,54 @@ def test_zip_lying_about_size_still_hits_the_total_cap(monkeypatch: pytest.Monke
     assert body["saved"] <= 1
 
 
-def test_zip_entry_count_is_capped(monkeypatch: pytest.MonkeyPatch):
+def _no_large_reads(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record every read size ZipFile gets while it opens an archive."""
+    sizes = []
+    real = upload._CappedOpen.read
+
+    def spy(self, n=-1):
+        data = real(self, n)
+        if self.armed:
+            sizes.append(len(data))
+        return data
+
+    monkeypatch.setattr(upload._CappedOpen, "read", spy)
+    return sizes
+
+
+def test_zip_with_too_many_entries_is_refused(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(upload, "_MAX_ZIP_ENTRIES", 3)
     photos = [(f"p{i}.jpg", _jpeg((64, 48), (i, 2, 2))) for i in range(6)]
-    body = _post(_client(), "test", [("many.zip", _zip_of(photos))]).get_json()
-    assert body["saved"] == 3
+    data = _zip_of(photos)
+    reads = _no_large_reads(monkeypatch)
+    body = _post(_client(), "test", [("many.zip", data)]).get_json()
+    assert (body["saved"], body["skipped"]) == (0, 1)
+    assert all(r <= upload._MAX_ZIP_DIRECTORY_BYTES for r in reads)
+
+
+
+def test_zip_directory_size_is_capped_whatever_the_count_says(monkeypatch: pytest.MonkeyPatch):
+    photos = [(f"p{i}.jpg", _jpeg((64, 48), (i, 3, 3))) for i in range(6)]
+    raw = bytearray(_zip_of(photos))
+    end = raw.rfind(b"PK\x05\x06")
+    raw[end + 8:end + 12] = (1).to_bytes(2, "little") * 2  # claim one entry
+    monkeypatch.setattr(upload, "_MAX_ZIP_DIRECTORY_BYTES", 200)
+    reads = _no_large_reads(monkeypatch)
+    body = _post(_client(), "test", [("dir.zip", bytes(raw))]).get_json()
+    assert (body["saved"], body["skipped"]) == (0, 1)
+    assert all(r <= upload._MAX_ZIP_DIRECTORY_BYTES for r in reads)
+
+
+
+def test_zip_member_names_are_escaped_in_logs(caplog: pytest.LogCaptureFixture):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(zipfile.ZipInfo("a\nFORGED log line.jpg"), b"x" * 10,
+                    compress_type=zipfile.ZIP_BZIP2)
+    with caplog.at_level("WARNING", logger="app.upload"):
+        _post(_client(), "test", [("evil.zip", buf.getvalue())])
+    messages = [r.getMessage() for r in caplog.records if "compression method" in r.getMessage()]
+    assert messages and all("\n" not in m for m in messages)
 
 
 def test_undecodable_zip_member_is_skipped(monkeypatch: pytest.MonkeyPatch):
@@ -406,3 +449,86 @@ def test_zip_methods_without_bounded_inflate_are_skipped(method: int):
     body = _post(_client(), "test", [("mixed.zip", buf.getvalue())]).get_json()
     assert (body["saved"], body["skipped"]) == (1, 1)
     assert os.listdir(os.path.join(MEDIA_BASE, "test")) == ["fine.jpg"]
+
+
+def _as_zip64(data: bytes, disks: int = 1, claim_bytes: int = 0, sentinels: bool = True,
+              locator_offset=None, comment: bytes = b"") -> bytes:
+    """Rewrite a small archive to use a ZIP64 end record, as zipfile writes it."""
+    import struct
+
+    pos = data.rfind(b"PK\x05\x06")
+    (_s, _d, _cd, _h, n, cd_size, cd_off, _c) = struct.unpack_from("<4sHHHHIIH", data, pos)
+    body = data[:pos]
+    record = b"PK\x06\x06" + struct.pack("<QHHIIQQQQ", 44, 45, 45, 0, 0, n, n,
+                                          claim_bytes or cd_size, cd_off)
+    offset = len(body) if locator_offset is None else locator_offset
+    locator = b"PK\x06\x07" + struct.pack("<IQI", 0, offset, disks)
+    if sentinels:
+        fields = (0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+    else:
+        fields = (n, n, cd_size, cd_off)
+    end = b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, *fields, len(comment)) + comment
+    return body + record + locator + end
+
+
+def test_zip64_end_record_is_read():
+    photos = [(f"p{i}.jpg", _jpeg((64, 48), (i * 90, 6, 6))) for i in range(3)]
+    data = _as_zip64(_zip_of(photos))
+    assert _post(_client(), "test", [("z64.zip", data)]).get_json()["saved"] == 3
+
+
+def test_multi_disk_zip64_is_skipped_not_a_server_error():
+    data = _as_zip64(_zip_of([("a.jpg", _jpeg((64, 48)))]), disks=2)
+    resp = _post(_client(), "test", [("span.zip", data)])
+    assert resp.status_code == 400
+    assert resp.get_json()["skipped"] == 1
+
+
+def test_directory_cap_fits_a_full_archive_of_ordinary_names():
+    # 5,000 entries named like a phone export must stay under the byte cap.
+    per_entry = 46 + len("DCIM/Camera/PXL_20240101_120000000.MP.jpg")
+    assert per_entry * upload._MAX_ZIP_ENTRIES < upload._MAX_ZIP_DIRECTORY_BYTES
+
+
+def test_zip64_locator_offset_out_of_range_is_skipped_not_a_server_error():
+    data = _as_zip64(_zip_of([("a.jpg", _jpeg((64, 48), (2, 4, 6)))]), locator_offset=2**63 + 5)
+    resp = _post(_client(), "test", [("far.zip", data)])
+    assert resp.status_code in (200, 400)
+
+
+def test_zip64_with_a_long_comment_is_read():
+    photos = [(f"p{i}.jpg", _jpeg((64, 48), (i * 120, 7, 7))) for i in range(2)]
+    data = _as_zip64(_zip_of(photos), comment=b"c" * 0xFFFF)
+    assert _post(_client(), "test", [("long.zip", data)]).get_json()["saved"] == 2
+
+
+def test_zip64_with_prepended_data_still_uploads():
+    photos = [(f"p{i}.jpg", _jpeg((64, 48), (i * 120, 8, 8))) for i in range(2)]
+    data = b"\0" * 4096 + _as_zip64(_zip_of(photos))  # stored offsets stay relative
+    assert _post(_client(), "test", [("sfx.zip", data)]).get_json()["saved"] == 2
+
+
+def _many_entry_zip64(understate: bool = True) -> bytes:
+    """A real 60-entry archive with a ZIP64 end record; the classic record understates it."""
+    import struct
+
+    entries = [(f"n{i:03d}.jpg", bytes([i]) * 8) for i in range(60)]
+    data = bytearray(_as_zip64(_zip_of(entries, zipfile.ZIP_STORED), sentinels=False))
+    if understate:
+        pos = data.rfind(b"PK\x05\x06")
+        struct.pack_into("<HHI", data, pos + 8, 1, 1, 46)  # one entry, 46 bytes
+    return bytes(data)
+
+
+def test_zip64_directory_counts_even_when_the_classic_record_understates_it(
+        monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(upload, "_MAX_ZIP_DIRECTORY_BYTES", 1000)
+    reads = _no_large_reads(monkeypatch)
+    body = _post(_client(), "test", [("quiet.zip", _many_entry_zip64())]).get_json()
+    assert (body["saved"], body["skipped"]) == (0, 1)
+    assert all(r <= upload._MAX_ZIP_DIRECTORY_BYTES for r in reads)
+
+
+def test_the_same_archive_imports_under_a_normal_cap():
+    body = _post(_client(), "test", [("ok.zip", _many_entry_zip64(understate=False))]).get_json()
+    assert body["saved"] == 60

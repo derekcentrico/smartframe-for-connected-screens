@@ -39,6 +39,10 @@ _SAFE_FRAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _MAX_ZIP_MEMBER_BYTES = 50 * 1024 * 1024
 _MAX_ZIP_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_ZIP_ENTRIES = 5000
+# zipfile loads and parses the whole central directory when an archive is
+# opened, before any per-entry check can run. 5,000 entries with names up to
+# about 150 characters fit; tiny entries cap out near 20,000.
+_MAX_ZIP_DIRECTORY_BYTES = 1024 * 1024
 # Methods whose readers stop inflating at the size requested.
 _ZIP_METHODS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
@@ -229,28 +233,73 @@ def _save_file(data: bytes, filename: str, target_dir: str,
     return "saved"
 
 
+class _DirectoryTooLarge(Exception):
+    pass
+
+
+class _CappedOpen:
+    """File wrapper that refuses any single read over a cap while armed.
+
+    ZipFile loads the whole central directory with one read of the size the
+    end record gives, then parses it from memory. Capping reads while the
+    archive is opened bounds that directory whichever end record (classic or
+    ZIP64, wherever it sits) zipfile decides to trust. Member reads happen
+    after it is disarmed.
+    """
+
+    def __init__(self, raw, cap: int):
+        self._raw = raw
+        self._cap = cap
+        self.armed = True
+
+    def read(self, n: int = -1) -> bytes:
+        if not self.armed:
+            return self._raw.read(n)
+        want = self._cap + 1 if n is None or n < 0 or n > self._cap else n
+        data = self._raw.read(want)
+        if len(data) > self._cap:
+            raise _DirectoryTooLarge
+        return data
+
+    def seek(self, *args):
+        return self._raw.seek(*args)
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    def seekable(self) -> bool:
+        return True
+
+
 def _iter_zip_members(stream):
     """Yield ``(safe_name, data)`` for supported members of a ZIP archive.
 
     Members are decompressed one at a time from *stream*; ``(None, None)`` marks
     a skipped entry so the caller can count it.
     """
+    capped = _CappedOpen(stream, _MAX_ZIP_DIRECTORY_BYTES)
     try:
-        zf = zipfile.ZipFile(stream)
-    except (zipfile.BadZipFile, OSError, EOFError, ValueError):
+        zf = zipfile.ZipFile(capped)
+    except _DirectoryTooLarge:
+        logger.warning("ZIP directory over %d bytes, skipping", _MAX_ZIP_DIRECTORY_BYTES)
+        yield None, None
+        return
+    except (zipfile.BadZipFile, OSError, EOFError, ValueError, OverflowError):
         logger.warning("Bad ZIP file received", exc_info=True)
+        yield None, None
+        return
+    capped.armed = False
+    if len(zf.infolist()) > _MAX_ZIP_ENTRIES:
+        logger.warning("ZIP has %d entries, over %d; skipping",
+                       len(zf.infolist()), _MAX_ZIP_ENTRIES)
+        zf.close()
         yield None, None
         return
 
     inflated = 0
     with zf:
-        for entry_no, info in enumerate(zf.infolist()):
+        for info in zf.infolist():
             member = info.filename
-            if entry_no >= _MAX_ZIP_ENTRIES:
-                logger.warning("ZIP has more than %d entries; ignoring the rest",
-                               _MAX_ZIP_ENTRIES)
-                yield None, None
-                return
             if info.is_dir():
                 continue
             basename = os.path.basename(member)
@@ -268,12 +317,12 @@ def _iter_zip_members(stream):
                 # with no output limit, so a tiny member can claim little and
                 # still allocate a great deal. Phones and desktop tools write
                 # stored or deflate.
-                logger.warning("ZIP member %s uses compression method %d, skipping",
+                logger.warning("ZIP member %r uses compression method %d, skipping",
                                member, info.compress_type)
                 yield None, None
                 continue
             if info.file_size > _MAX_ZIP_MEMBER_BYTES:
-                logger.warning("ZIP member %s too large (%d bytes), skipping",
+                logger.warning("ZIP member %r too large (%d bytes), skipping",
                                member, info.file_size)
                 yield None, None
                 continue
@@ -296,7 +345,7 @@ def _iter_zip_members(stream):
                     NotImplementedError, zlib.error):
                 # ValueError covers undecodable member names. The work spent
                 # on a corrupt member is bounded by its declared size.
-                logger.warning("Failed to read ZIP member %s", member, exc_info=True)
+                logger.warning("Failed to read ZIP member %r", member, exc_info=True)
                 inflated += info.file_size
                 yield None, None
                 continue
@@ -307,7 +356,7 @@ def _iter_zip_members(stream):
                 yield None, None
                 return
             if len(member_data) > _MAX_ZIP_MEMBER_BYTES:
-                logger.warning("ZIP member %s inflates past the cap, skipping", member)
+                logger.warning("ZIP member %r inflates past the cap, skipping", member)
                 yield None, None
                 continue
             yield safe_name, member_data
@@ -351,11 +400,11 @@ def _upload_targets(targets):
         if not t:
             continue
         if not _SAFE_FRAME_RE.match(t):
-            logger.warning("Rejected invalid frame name: %s", t)
+            logger.warning("Rejected invalid frame name: %r", t)
             continue
         real_target = os.path.realpath(os.path.join(MEDIA_BASE, t.lower()))
         if os.path.commonpath([real_target, media_root]) != media_root:
-            logger.warning("Path traversal blocked for frame: %s", t)
+            logger.warning("Path traversal blocked for frame: %r", t)
             continue
         try:
             os.makedirs(real_target, exist_ok=True)
