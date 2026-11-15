@@ -1,10 +1,31 @@
 # SmartFrame
 
-*A self-hosted photo & video frame server for repurposed Lenovo Smart Frames (or any Fully Kiosk Browser display)*
+*Self-hosted photo and video slideshow for Lenovo Smart Frames, Android tablets, and any screen that runs a kiosk browser*
 
 ![Docker](https://img.shields.io/badge/Docker-ready-blue)
 ![Python](https://img.shields.io/badge/Python-3.12-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
+
+---
+
+## Why this exists
+
+The Lenovo Smart Frame is a 21.5-inch portrait display built around Google Photos. Without its Google Photos feed it is good hardware with nothing to show. SmartFrame gives it a new source: a small server on your own network serves a slideshow page, and the frame shows it full screen in Fully Kiosk Browser. Photos stay on your own storage, with no cloud account, and you add new ones from your phone through a LAN upload page.
+
+## Supported screens
+
+- **Lenovo Smart Frame** (21.5", portrait 1080x1920) running Fully Kiosk Browser. This is what it runs on every day.
+- **Android or Fire tablets** running Fully Kiosk Browser.
+- **Any other screen with a full-screen browser**, such as a Raspberry Pi or mini PC with Chromium in kiosk mode, or a wall-mounted monitor. The frame page is plain ES5 JavaScript for older browsers, and layouts are computed from the actual screen size, so landscape screens work as well as portrait ones.
+
+Only the Lenovo Smart Frame is tested day to day; the others need nothing more than a browser that can open the frame URL.
+
+### Fully Kiosk Browser setup
+
+1. Install Fully Kiosk Browser on the frame or tablet.
+2. Set its start URL to `http://<host-ip>:8383/frame/<frame-name>`.
+3. Keep the screen on in Fully; dimming and pausing can come from Home Assistant instead (see Frame Configuration).
+4. Add photos from a phone at `http://<host-ip>:8383/upload`.
 
 ---
 
@@ -27,7 +48,7 @@
 ## Requirements
 
 - **Docker** (with Docker Compose)
-- **Fully Kiosk Browser** (on the Lenovo Smart Frame or any Android/tablet display)
+- **A display with a full-screen browser**: Fully Kiosk Browser on a Lenovo Smart Frame or Android tablet, or Chromium in kiosk mode
 - **Home Assistant** (optional, for motion control and status lines)
 
 ## Quick Start
