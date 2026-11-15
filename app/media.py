@@ -3,9 +3,11 @@ Media listing, image caching / resizing, and HEIC support.
 """
 
 import logging
+import math
 import os
 import random
 import tempfile
+import threading
 import time
 
 from PIL import Image, ImageOps
@@ -66,45 +68,73 @@ def _safe_cache_path(frame_name: str, rel_path: str) -> str:
     return path
 
 
+# One full-size decode at a time per process. Upload pre-caching, frame
+# requests for new photos and the face worker all land here, and a 12 MP
+# photo needs well over 100 MB while it is being decoded.
+_decode_slot = threading.Lock()
+
+_CACHE_BOX = (1080, 1920)
+# EXIF orientations that swap width and height.
+_ROTATED = {5, 6, 7, 8}
+
+
+def _cache_is_current(cache_path: str, full_src_path: str) -> bool:
+    if not os.path.isfile(cache_path):
+        return False
+    return os.path.getmtime(full_src_path) <= os.path.getmtime(cache_path)
+
+
+def _render_cache_image(full_src_path: str, cache_path: str) -> None:
+    with Image.open(full_src_path) as src:
+        box = _CACHE_BOX
+        if src.getexif().get(0x0112) in _ROTATED:
+            box = (_CACHE_BOX[1], _CACHE_BOX[0])
+        # JPEGs decode straight to the smallest DCT scale that still covers
+        # the final size; shrinking before rotating avoids any full-size copy.
+        scale = min(1.0, box[0] / src.width, box[1] / src.height)
+        src.draft(src.mode, (math.ceil(src.width * scale), math.ceil(src.height * scale)))
+        if src.mode not in ("RGB", "RGBA", "L", "CMYK"):
+            src = src.convert("RGB")
+        src.thumbnail(box, Image.LANCZOS)
+        im = ImageOps.exif_transpose(src).convert("RGB")
+    # Write then rename: the face worker and request threads both build
+    # cache images, and a reader must never see a half-written JPEG.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cache_path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            im.save(fh, "JPEG", quality=72, optimize=True, progressive=True)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, cache_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def get_cached_image(frame_name: str, full_src_path: str, rel_path: str):
     """Return absolute path to a resized 1080x1920 image, creating it if needed.
 
     Returns ``None`` if the image cannot be processed.
     """
     cache_path = _safe_cache_path(frame_name, rel_path)
-
-    if os.path.isfile(cache_path):
-        # Invalidate if source is newer than cache
-        try:
-            if os.path.getmtime(full_src_path) <= os.path.getmtime(cache_path):
-                return cache_path
-        except OSError:
-            return None
-        # else fall through to regenerate
-
     try:
-        im = Image.open(full_src_path)
-        im = ImageOps.exif_transpose(im)
-        im = im.convert("RGB")
-        im.thumbnail((1080, 1920), Image.LANCZOS)
-        # Write then rename: the face worker and request threads both build
-        # cache images, and a reader must never see a half-written JPEG.
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cache_path), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                im.save(fh, "JPEG", quality=72, optimize=True, progressive=True)
-            os.chmod(tmp, 0o644)
-            os.replace(tmp, cache_path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return cache_path
-    except Exception:
-        logger.warning("Failed to cache image %s", full_src_path, exc_info=True)
+        if _cache_is_current(cache_path, full_src_path):
+            return cache_path
+    except OSError:
         return None
+
+    with _decode_slot:
+        try:
+            # Another thread may have built it while this one waited.
+            if _cache_is_current(cache_path, full_src_path):
+                return cache_path
+            _render_cache_image(full_src_path, cache_path)
+            return cache_path
+        except Exception:
+            logger.warning("Failed to cache image %s", full_src_path, exc_info=True)
+            return None
 
 
 # ---------------------

@@ -10,10 +10,10 @@
 
 ## Features
 
-- **Collage layouts**: Random grid-based collages (single full-screen, two stacked, big + small tiles) with smooth cross-fades
-- **Smart object-fit**: Images use full-bleed `cover` in multi-tile layouts and fall back to `contain` (letterbox) when cropping would be too severe
+- **Collage layouts**: A dozen grid layouts (full screen, stacked rows, landscape strip over a big portrait, 2x2, big tile with small ones, side by side) with smooth cross-fades
+- **Shape-aware layouts**: The next few photos and clips load ahead, and each collage uses a layout whose tiles match their real shapes, so landscape shots land in wide tiles and portraits in tall ones. A photo that suits nothing else is shown on its own over a blurred backdrop
 - **Face-aware cropping**: Detects faces and positions each crop so they stay in view. People who appear often in your library are found automatically and kept on screen first; when nothing fits, the photo is letterboxed instead of cutting a face
-- **Video support**: Plays MP4 clips inline, with configurable max file size
+- **Video support**: Plays MP4 clips inline, placed by their real orientation, at most one per collage, with configurable max file size
 - **HEIC/HEIF support**: Processes Apple HEIC photos automatically via pillow-heif
 - **Image caching**: EXIF-corrected, resized to 1080x1920, compressed JPEG cache for instant loads
 - **Weather overlay**: Live weather from Open-Meteo with configurable location and temperature offset
@@ -72,11 +72,12 @@ If a per-frame motion entity is not set, the app falls back to a global `HA_MOTI
 Access the upload page at `http://<host-ip>:8383/upload` or target a specific frame at `/upload/<frame-name>`.
 
 - **Supported formats**: JPG, JPEG, PNG, MP4, HEIC, HEIF
-- **ZIP archives**: Upload a `.zip` containing supported files; they are extracted automatically (Mac metadata like `__MACOSX/` and `.DS_Store` are skipped)
+- **ZIP archives**: Upload a `.zip` containing supported files; they are extracted automatically (Mac metadata like `__MACOSX/` and `.DS_Store` are skipped). Each archive is limited to 5,000 entries, 50 MB per file and 2 GB extracted in total; only stored and deflate entries (what phones and desktop tools write) are read
 - **Deduplication**: Files with the same SHA-256 hash as existing files are skipped
+- **Large selections**: The page sends one file per request and retries only the file that failed, so any number of photos can go up at once. `MAX_UPLOAD_MB` applies to each file (or ZIP)
 - **Optional auth**: Set `UPLOAD_AUTH_ENABLED=1` in `.env` and configure `UPLOAD_USERNAME` / `UPLOAD_PASSWORD`
 
-Uploaded images are pre-cached in a background thread so they display immediately on the next slideshow cycle.
+Uploaded images are pre-cached in a background thread so they display immediately on the next slideshow cycle. Each container resizes one photo at a time, and JPEGs are decoded at reduced scale, so memory stays flat however many photos arrive.
 
 ## Home Assistant Integration
 
@@ -140,7 +141,7 @@ Each frame reads media from `MEDIA_BASE/<frame-name>/` (e.g. `/media/smartframes
 | `FAVORITE_MIN_PHOTOS` | `15` | Photos a person must appear in to count as a frequent face |
 | `FACE_SCAN_INTERVAL` | `300` | Seconds between face scans for new photos |
 | `FACE_MODEL_DIR` | `/models` | Directory holding the face models (baked into the image) |
-| `MAX_UPLOAD_MB` | `200` | Maximum upload size in MB |
+| `MAX_UPLOAD_MB` | `200` | Maximum size of one upload request (one file or ZIP from the page) in MB |
 | `UPLOAD_AUTH_ENABLED` | `0` | Set to `1` to require HTTP Basic auth on upload |
 | `UPLOAD_USERNAME` | *(none)* | Upload auth username (required when auth is on) |
 | `UPLOAD_PASSWORD` | *(none)* | Upload auth password (required when auth is on) |
@@ -157,6 +158,8 @@ app/
 ├── ha.py           # Home Assistant helpers (motion, status, parallel fetch)
 ├── upload.py       # Upload blueprint (dedup, ZIP, optional auth)
 ├── routes.py       # Main routes blueprint (frame, img, media, motion, etc.)
+├── static/
+│   └── collage.js  # Layout choice and per-tile fit (ES5, unit-tested under node)
 └── templates/
     ├── frame.html  # Slideshow display page
     └── upload.html # Upload form page

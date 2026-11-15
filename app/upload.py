@@ -5,13 +5,13 @@ Upload blueprint: file uploads with deduplication, ZIP extraction, and optional 
 import errno
 import hashlib
 import hmac
-import io
 import logging
 import os
 import re
 import tempfile
 import time
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 
@@ -19,6 +19,7 @@ from flask import Blueprint, Response, jsonify, render_template, request
 from werkzeug.utils import secure_filename
 
 from .config import (
+    MAX_UPLOAD_MB,
     MEDIA_BASE,
     UPLOAD_AUTH_ENABLED,
     UPLOAD_PASSWORD,
@@ -33,11 +34,21 @@ upload_bp = Blueprint("upload", __name__)
 # Only allow alphanumeric, underscore, and hyphen in frame names.
 _SAFE_FRAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-# Max decompressed size per ZIP member (50 MB).
+# Max decompressed size per ZIP member (50 MB), and per archive in total and
+# entry count, so a small archive cannot inflate until the media disk is full.
 _MAX_ZIP_MEMBER_BYTES = 50 * 1024 * 1024
+_MAX_ZIP_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_ZIP_ENTRIES = 5000
+# zipfile loads and parses the whole central directory when an archive is
+# opened, before any per-entry check can run. 5,000 entries with names up to
+# about 150 characters fit; tiny entries cap out near 20,000.
+_MAX_ZIP_DIRECTORY_BYTES = 1024 * 1024
+# Methods whose readers stop inflating at the size requested.
+_ZIP_METHODS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
-# Bounded thread pool for background image caching (prevents thread exhaustion).
-_cache_pool = ThreadPoolExecutor(max_workers=4)
+# Background pre-caching. One thread: decodes are serialized in media anyway,
+# and a queue of waiting threads only holds requests open longer.
+_cache_pool = ThreadPoolExecutor(max_workers=1)
 
 # Extensions accepted for direct upload / ZIP member extraction
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -57,19 +68,44 @@ _hash_cache: dict = {}
 _HASH_CACHE_TTL = 60  # seconds
 
 
+def _dir_signature(frame_dir: str) -> tuple:
+    """Names and directory mtimes under *frame_dir*.
+
+    Adding, removing or renaming a file changes it. Names are included because
+    directory mtimes are only as fine as the kernel's clock tick.
+    """
+    sig = []
+    for root, _dirs, files in os.walk(frame_dir):
+        try:
+            mtime = os.stat(root).st_mtime_ns
+        except OSError:
+            continue
+        sig.append((root, mtime, hash(tuple(sorted(files)))))
+    return tuple(sig)
+
+
 def _get_existing_hashes(frame_dir: str) -> set:
-    """Return a set of SHA-256 hashes for *frame_dir*, using a short-lived cache."""
+    """Return a set of SHA-256 hashes for *frame_dir*, using a short-lived cache.
+
+    The cache is dropped when the directory changes outside an upload, so a
+    photo deleted a moment ago is not reported as a duplicate.
+    """
+    sig = _dir_signature(frame_dir)
     cached = _hash_cache.get(frame_dir)
-    if cached and time.time() - cached["built_at"] < _HASH_CACHE_TTL:
+    if (cached and time.time() - cached["built_at"] < _HASH_CACHE_TTL
+            and cached["sig"] == sig):
         return cached["hashes"]
 
     hashes = _build_existing_hashes(frame_dir)
-    _hash_cache[frame_dir] = {"hashes": hashes, "built_at": time.time()}
+    _hash_cache[frame_dir] = {"hashes": hashes, "built_at": time.time(), "sig": sig}
     return hashes
 
 
-def _invalidate_hash_cache(frame_dir: str):
-    _hash_cache.pop(frame_dir, None)
+def _note_own_writes(frame_dir: str) -> None:
+    """Accept this upload's own changes; _save_file already added their hashes."""
+    cached = _hash_cache.get(frame_dir)
+    if cached:
+        cached["sig"] = _dir_signature(frame_dir)
 
 
 # ---------------------
@@ -143,7 +179,7 @@ def _save_file(data: bytes, filename: str, target_dir: str,
     """
     Save *data* as *filename* into *target_dir*.
 
-    Returns ``"saved"`` | ``"duplicate"`` | ``"unsupported"``.
+    Returns ``"saved"`` | ``"duplicate"`` | ``"unsupported"`` | ``"failed"``.
     Handles collision when filename exists but hash differs.
     *data_hash* may be supplied to avoid recomputing when the caller already has it.
     """
@@ -187,7 +223,7 @@ def _save_file(data: bytes, filename: str, target_dir: str,
             logger.exception("Disk full writing %s", dest_path)
         else:
             logger.warning("Failed to write uploaded file %s", dest_path, exc_info=True)
-        return "unsupported"
+        return "failed"
 
     # Pre-cache images via bounded thread pool
     if ext in _IMAGE_EXTENSIONS:
@@ -197,60 +233,186 @@ def _save_file(data: bytes, filename: str, target_dir: str,
     return "saved"
 
 
-def _extract_zip_members(data: bytes):
-    """Extract supported members from a ZIP archive.
+class _DirectoryTooLarge(Exception):
+    pass
 
-    Returns a list of ``(safe_name, member_data)`` tuples ready for saving,
-    plus a count of skipped entries.  The ZIP is decompressed only once.
+
+class _CappedOpen:
+    """File wrapper that refuses any single read over a cap while armed.
+
+    ZipFile loads the whole central directory with one read of the size the
+    end record gives, then parses it from memory. Capping reads while the
+    archive is opened bounds that directory whichever end record (classic or
+    ZIP64, wherever it sits) zipfile decides to trust. Member reads happen
+    after it is disarmed.
     """
-    members = []
-    skipped = 0
 
+    def __init__(self, raw, cap: int):
+        self._raw = raw
+        self._cap = cap
+        self.armed = True
+
+    def read(self, n: int = -1) -> bytes:
+        if not self.armed:
+            return self._raw.read(n)
+        want = self._cap + 1 if n is None or n < 0 or n > self._cap else n
+        data = self._raw.read(want)
+        if len(data) > self._cap:
+            raise _DirectoryTooLarge
+        return data
+
+    def seek(self, *args):
+        return self._raw.seek(*args)
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    def seekable(self) -> bool:
+        return True
+
+
+def _iter_zip_members(stream):
+    """Yield ``(safe_name, data)`` for supported members of a ZIP archive.
+
+    Members are decompressed one at a time from *stream*; ``(None, None)`` marks
+    a skipped entry so the caller can count it.
+    """
+    capped = _CappedOpen(stream, _MAX_ZIP_DIRECTORY_BYTES)
     try:
-        zf = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile:
-        logger.warning("Bad ZIP file received")
-        return members, 1
+        zf = zipfile.ZipFile(capped)
+    except _DirectoryTooLarge:
+        logger.warning("ZIP directory over %d bytes, skipping", _MAX_ZIP_DIRECTORY_BYTES)
+        yield None, None
+        return
+    except (zipfile.BadZipFile, OSError, EOFError, ValueError, OverflowError):
+        logger.warning("Bad ZIP file received", exc_info=True)
+        yield None, None
+        return
+    capped.armed = False
+    if len(zf.infolist()) > _MAX_ZIP_ENTRIES:
+        logger.warning("ZIP has %d entries, over %d; skipping",
+                       len(zf.infolist()), _MAX_ZIP_ENTRIES)
+        zf.close()
+        yield None, None
+        return
 
-    for member in zf.namelist():
-        if member.endswith("/"):
-            continue
-        basename = os.path.basename(member)
-        if (member.startswith("__MACOSX/") or basename == ".DS_Store"
-                or basename.startswith("._")):
-            continue
-
-        ext = os.path.splitext(basename)[1].lower()
-        if ext not in _MEDIA_EXTENSIONS:
-            skipped += 1
-            continue
-
-        try:
-            info = zf.getinfo(member)
-            if info.file_size > _MAX_ZIP_MEMBER_BYTES:
-                logger.warning("ZIP member %s too large (%d bytes), skipping",
-                               member, info.file_size)
-                skipped += 1
+    inflated = 0
+    with zf:
+        for info in zf.infolist():
+            member = info.filename
+            if info.is_dir():
                 continue
-        except KeyError:
-            skipped += 1
-            continue
+            basename = os.path.basename(member)
+            if (member.startswith("__MACOSX/") or basename == ".DS_Store"
+                    or basename.startswith("._")):
+                continue
 
+            ext = os.path.splitext(basename)[1].lower()
+            safe_name = secure_filename(basename)
+            if ext not in _MEDIA_EXTENSIONS or not safe_name:
+                yield None, None
+                continue
+            if info.compress_type not in _ZIP_METHODS:
+                # zipfile's bzip2 and LZMA readers inflate a whole input chunk
+                # with no output limit, so a tiny member can claim little and
+                # still allocate a great deal. Phones and desktop tools write
+                # stored or deflate.
+                logger.warning("ZIP member %r uses compression method %d, skipping",
+                               member, info.compress_type)
+                yield None, None
+                continue
+            if info.file_size > _MAX_ZIP_MEMBER_BYTES:
+                logger.warning("ZIP member %r too large (%d bytes), skipping",
+                               member, info.file_size)
+                yield None, None
+                continue
+
+            budget = _MAX_ZIP_TOTAL_BYTES - inflated
+            if info.file_size > budget:
+                logger.warning("ZIP inflates past %d bytes; ignoring the rest",
+                               _MAX_ZIP_TOTAL_BYTES)
+                yield None, None
+                return
+
+            try:
+                with zf.open(info) as fh:
+                    # Ask for no more than the declared size, already checked
+                    # against both caps: zipfile inflates as much as a read
+                    # requests, even past a size that then fails the CRC. A
+                    # member larger than it claims is cut short and fails it.
+                    member_data = fh.read(info.file_size + 1)
+            except (OSError, EOFError, ValueError, zipfile.BadZipFile, RuntimeError,
+                    NotImplementedError, zlib.error):
+                # ValueError covers undecodable member names. The work spent
+                # on a corrupt member is bounded by its declared size.
+                logger.warning("Failed to read ZIP member %r", member, exc_info=True)
+                inflated += info.file_size
+                yield None, None
+                continue
+            inflated += len(member_data)
+            if len(member_data) > budget:
+                logger.warning("ZIP inflates past %d bytes; ignoring the rest",
+                               _MAX_ZIP_TOTAL_BYTES)
+                yield None, None
+                return
+            if len(member_data) > _MAX_ZIP_MEMBER_BYTES:
+                logger.warning("ZIP member %r inflates past the cap, skipping", member)
+                yield None, None
+                continue
+            yield safe_name, member_data
+            member_data = None  # drop it before inflating the next member
+
+
+def _iter_upload_items(files):
+    """Yield ``(filename, data)`` per uploaded file or ZIP member, one at a time.
+
+    ``(None, None)`` marks a skipped input.
+    """
+    for f in files:
+        if not f or not f.filename:
+            continue
+        filename = secure_filename(f.filename)
+        if not filename:
+            continue
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            yield None, None
+            continue
+        if ext == ".zip":
+            # Werkzeug spools large parts to disk, so the archive is read
+            # from there rather than copied into memory.
+            yield from _iter_zip_members(f.stream)
+            continue
         try:
-            member_data = zf.read(member)
-        except Exception:
-            logger.warning("Failed to read ZIP member %s", member, exc_info=True)
-            skipped += 1
+            data = f.read()
+        except OSError:
+            logger.warning("Failed to read upload %s", filename, exc_info=True)
             continue
+        yield filename, data
+        data = None  # drop it before reading the next file
 
-        safe_name = secure_filename(basename)
-        if not safe_name:
-            skipped += 1
+
+def _upload_targets(targets):
+    """Return ``[(frame, real_dir, existing_hashes)]`` for valid target frames."""
+    dests = []
+    media_root = os.path.realpath(MEDIA_BASE)
+    for t in targets:
+        if not t:
             continue
-
-        members.append((safe_name, member_data))
-
-    return members, skipped
+        if not _SAFE_FRAME_RE.match(t):
+            logger.warning("Rejected invalid frame name: %r", t)
+            continue
+        real_target = os.path.realpath(os.path.join(MEDIA_BASE, t.lower()))
+        if os.path.commonpath([real_target, media_root]) != media_root:
+            logger.warning("Path traversal blocked for frame: %r", t)
+            continue
+        try:
+            os.makedirs(real_target, exist_ok=True)
+        except OSError:
+            logger.warning("Cannot create frame dir %s", real_target)
+            continue
+        dests.append((t, real_target, _get_existing_hashes(real_target)))
+    return dests
 
 
 # ---------------------
@@ -278,6 +440,7 @@ def _handle_upload(frame_name_from_path=None):
     message = ""
     is_error = False
     default_frame = frame_name_from_path
+    counts = {"saved": 0, "duplicates": 0, "skipped": 0, "failed": 0}
 
     if request.method == "POST":
         target = request.form.get("frame") or frame_name_from_path
@@ -298,75 +461,40 @@ def _handle_upload(frame_name_from_path=None):
                 total_saved = 0
                 total_dup = 0
                 total_skipped = 0
+                total_failed = 0
 
-                # Pre-read all file data and pre-hash.
-                # ZIP archives are decompressed once here.
-                prepared_items = []  # [(filename, ext, data, data_hash)]
-                for f in files:
-                    if not f or not f.filename:
-                        continue
-                    filename = secure_filename(f.filename)
-                    if not filename:
-                        continue
-                    ext = os.path.splitext(filename)[1].lower()
-                    if ext not in ALLOWED_EXTENSIONS:
-                        total_skipped += 1
-                        continue
-                    try:
-                        data = f.read()
-                    except Exception:
-                        logger.warning("Failed to read upload %s", filename, exc_info=True)
-                        continue
-
-                    if ext == ".zip":
-                        members, zip_skipped = _extract_zip_members(data)
-                        total_skipped += zip_skipped
-                        for safe_name, member_data in members:
-                            h = _file_hash(member_data)
-                            prepared_items.append((safe_name,
-                                                   os.path.splitext(safe_name)[1].lower(),
-                                                   member_data, h))
-                    else:
-                        h = _file_hash(data)
-                        prepared_items.append((filename, ext, data, h))
-
-                # Validate and process each target frame.
-                for t in targets:
-                    if not t:
-                        continue
-                    if not _SAFE_FRAME_RE.match(t):
-                        logger.warning("Rejected invalid frame name: %s", t)
-                        continue
-                    target_dir = os.path.join(MEDIA_BASE, t.lower())
-                    real_target = os.path.realpath(target_dir)
-                    if not real_target.startswith(os.path.realpath(MEDIA_BASE)):
-                        logger.warning("Path traversal blocked for frame: %s", t)
-                        continue
-                    try:
-                        os.makedirs(real_target, exist_ok=True)
-                    except OSError:
-                        logger.warning("Cannot create frame dir %s", real_target)
-                        continue
-
-                    existing_hashes = _get_existing_hashes(real_target)
-
-                    for filename, ext, data, data_hash in prepared_items:
-                        result = _save_file(
-                            data, filename, real_target, existing_hashes, t,
-                            data_hash=data_hash,
-                        )
-                        if result == "saved":
-                            total_saved += 1
-                        elif result == "duplicate":
-                            total_dup += 1
-                        else:
+                # One file in memory at a time: each is hashed, written to
+                # every target, then dropped before the next is read.
+                dests = _upload_targets(targets)
+                try:
+                    for filename, data in _iter_upload_items(files):
+                        if data is None:
                             total_skipped += 1
-
-                    _invalidate_hash_cache(real_target)
-
-                # Invalidate media cache for affected frames
-                for t in targets:
-                    invalidate_media_cache(t)
+                            continue
+                        data_hash = _file_hash(data)
+                        for t, real_target, existing_hashes in dests:
+                            result = _save_file(
+                                data, filename, real_target, existing_hashes, t,
+                                data_hash=data_hash,
+                            )
+                            if result == "saved":
+                                total_saved += 1
+                            elif result == "duplicate":
+                                total_dup += 1
+                            elif result == "failed":
+                                total_failed += 1
+                            else:
+                                total_skipped += 1
+                        del data
+                finally:
+                    # The cached hash sets already hold what _save_file added,
+                    # and the page sends one request per file, so they are kept.
+                    # Files saved before an error must still show up.
+                    for t, real_target, _hashes in dests:
+                        _note_own_writes(real_target)
+                        invalidate_media_cache(t)
+                counts = {"saved": total_saved, "duplicates": total_dup,
+                          "skipped": total_skipped, "failed": total_failed}
 
                 if total_saved > 0 or total_dup > 0:
                     parts = [f"Uploaded {total_saved} file(s)."]
@@ -374,7 +502,13 @@ def _handle_upload(frame_name_from_path=None):
                         parts.append(f"Skipped {total_dup} duplicate(s).")
                     if total_skipped:
                         parts.append(f"Skipped {total_skipped} unsupported file(s).")
+                    if total_failed:
+                        parts.append(f"Could not save {total_failed} file(s).")
+                        is_error = True
                     message = " ".join(parts)
+                elif total_failed:
+                    is_error = True
+                    message = f"Could not save {total_failed} file(s). Check disk space and permissions."
                 else:
                     is_error = True
                     if total_skipped and not total_saved:
@@ -385,7 +519,7 @@ def _handle_upload(frame_name_from_path=None):
     # Return JSON for XHR uploads, HTML for normal form submissions
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         status_code = 400 if is_error else 200
-        return jsonify({"message": message, "error": is_error}), status_code
+        return jsonify({"message": message, "error": is_error, **counts}), status_code
 
     return render_template(
         "upload.html",
@@ -393,6 +527,7 @@ def _handle_upload(frame_name_from_path=None):
         default_frame=default_frame,
         message=message,
         is_error=is_error,
+        max_upload_mb=MAX_UPLOAD_MB,
     )
 
 

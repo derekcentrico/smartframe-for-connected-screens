@@ -130,8 +130,10 @@
 
 <script>
 (function() {
+  // ES5: older phone browsers use this page too.
   var form       = document.getElementById("upload-form");
   var filesInput = document.getElementById("files");
+  var frameInput = document.getElementById("frame");
   var btn        = document.getElementById("upload-btn");
   var progWrap   = document.getElementById("progress-wrap");
   var progBar    = document.getElementById("progress-bar");
@@ -139,6 +141,8 @@
   var msgEl      = document.getElementById("message");
 
   var MAX_RETRIES = 3;
+  var MAX_BYTES   = {{ max_upload_mb|int }} * 1024 * 1024;
+  var FORM_SLACK  = 64 * 1024;  // multipart headers and the frame field
 
   function showMessage(text, isError) {
     msgEl.textContent = text;
@@ -152,61 +156,106 @@
     progText.textContent = label || "";
   }
 
-  function doUpload(formData, attempt) {
-    var xhr = new XMLHttpRequest();
-    xhr.open("POST", form.action || window.location.href, true);
-    xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
-
-    xhr.upload.onprogress = function(e) {
-      if (e.lengthComputable) {
-        var pct = Math.round(e.loaded / e.total * 100);
-        setProgress(pct, "Uploading\u2026 " + pct + "%");
-      }
-    };
-
-    xhr.onreadystatechange = function() {
-      if (xhr.readyState !== 4) return;
-
-      if (xhr.status === 200 || xhr.status === 400) {
-        try {
-          var data = JSON.parse(xhr.responseText);
-          showMessage(data.message || "Upload complete.", !!data.error);
-        } catch (e) {
-          showMessage("Upload complete.", false);
-        }
-        setProgress(100, "Done");
-        btn.disabled = false;
-        btn.textContent = "Upload";
-      } else {
-        retryOrFail(formData, attempt, "Server returned status " + xhr.status);
-      }
-    };
-
-    xhr.onerror = function() {
-      retryOrFail(formData, attempt, "Network error");
-    };
-
-    xhr.ontimeout = function() {
-      retryOrFail(formData, attempt, "Request timed out");
-    };
-
-    // 5 minute timeout for large uploads
-    xhr.timeout = 300000;
-    xhr.send(formData);
+  function plural(n, word) {
+    return n + " " + word + (n === 1 ? "" : "s");
   }
 
-  function retryOrFail(formData, attempt, reason) {
-    if (attempt < MAX_RETRIES) {
-      var delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
-      setProgress(0, reason + " \u2014 retrying in " + (delay / 1000) + "s\u2026 (attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
-      setTimeout(function() { doUpload(formData, attempt + 1); }, delay);
-    } else {
-      showMessage(reason + ". Upload failed after " + MAX_RETRIES + " attempts.", true);
-      setProgress(0, "Failed");
-      progWrap.style.display = "none";
+  // Files go up one request each, so a big selection never sits in server
+  // memory at once and a failure retries only that file.
+  function uploadAll(files, frame) {
+    var total = files.length;
+    var done = { saved: 0, duplicates: 0, skipped: 0, failed: [] };
+    var index = 0;
+
+    function finish() {
+      var parts = [];
+      parts.push("Uploaded " + plural(done.saved, "file") + ".");
+      if (done.duplicates) parts.push("Skipped " + plural(done.duplicates, "duplicate") + ".");
+      if (done.skipped) parts.push("Skipped " + done.skipped + " unsupported.");
+      if (done.failed.length) parts.push("Failed: " + done.failed.join(", ") + ".");
+      showMessage(parts.join(" "), done.failed.length > 0 || (!done.saved && !done.duplicates));
+      setProgress(100, "Done");
+      if (frameInput) frameInput.disabled = false;
       btn.disabled = false;
       btn.textContent = "Upload";
     }
+
+    function next() {
+      // Loop rather than recurse past oversized files.
+      while (index < total) {
+        var file = files[index];
+        index++;
+        if (MAX_BYTES && file.size > MAX_BYTES - FORM_SLACK) {
+          done.failed.push(file.name + " (over " + Math.round(MAX_BYTES / 1048576) + " MB)");
+          continue;
+        }
+        sendFile(file, 0);
+        return;
+      }
+      finish();
+    }
+
+    function label(filePct, note) {
+      var overall = ((index - 1) + filePct / 100) / total * 100;
+      setProgress(overall, "Uploading " + index + " of " + total + ": " + filePct + "%" + (note ? ". " + note : ""));
+    }
+
+    function sendFile(file, attempt) {
+      var data = new FormData();
+      data.append("frame", frame);
+      data.append("files", file, file.name);
+
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", form.action || window.location.href, true);
+      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+      xhr.timeout = 300000;
+
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) label(Math.round(e.loaded / e.total * 100));
+      };
+
+      function retryOrSkip(reason) {
+        if (attempt < MAX_RETRIES) {
+          var delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+          label(0, reason + ", retrying in " + (delay / 1000) + "s (attempt " + (attempt + 1) + "/" + MAX_RETRIES + ")");
+          setTimeout(function() { sendFile(file, attempt + 1); }, delay);
+        } else {
+          done.failed.push(file.name);
+          next();
+        }
+      }
+
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status === 200 || xhr.status === 400) {
+          var res = null;
+          try { res = JSON.parse(xhr.responseText); } catch (e) { res = null; }
+          if (!res) {
+            done.failed.push(file.name + " (unexpected response)");
+          } else {
+            done.saved += res.saved || 0;
+            done.duplicates += res.duplicates || 0;
+            done.skipped += res.skipped || 0;
+            if (res.failed) {
+              done.failed.push(file.name + " (could not be saved)");
+            } else if (res.error && !res.saved && !res.duplicates && !res.skipped) {
+              done.failed.push(file.name + " (" + (res.message || "rejected") + ")");
+            }
+          }
+          next();
+        } else if (xhr.status === 413) {
+          done.failed.push(file.name + " (too large)");
+          next();
+        } else if (xhr.status !== 0) {
+          retryOrSkip("Server returned status " + xhr.status);
+        }
+      };
+      xhr.onerror = function() { retryOrSkip("Network error"); };
+      xhr.ontimeout = function() { retryOrSkip("Request timed out"); };
+      xhr.send(data);
+    }
+
+    next();
   }
 
   form.onsubmit = function(e) {
@@ -221,9 +270,13 @@
     btn.disabled = true;
     btn.textContent = "Uploading\u2026";
 
-    var formData = new FormData(form);
+    var files = [];
+    for (var i = 0; i < filesInput.files.length; i++) files.push(filesInput.files[i]);
+    // Every file and retry goes to the frame chosen at submit time.
+    var frame = frameInput ? frameInput.value : "";
+    if (frameInput) frameInput.disabled = true;
     setProgress(0, "Starting upload\u2026");
-    doUpload(formData, 0);
+    uploadAll(files, frame);
   };
 })();
 </script>
