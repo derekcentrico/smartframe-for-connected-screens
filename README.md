@@ -10,10 +10,10 @@
 
 ## Features
 
-- **Collage layouts**: Random grid-based collages (single full-screen, two stacked, big + small tiles) with smooth cross-fades
-- **Smart object-fit**: Images use full-bleed `cover` in multi-tile layouts and fall back to `contain` (letterbox) when cropping would be too severe
+- **Collage layouts**: A dozen grid layouts (full screen, stacked rows, landscape strip over a big portrait, 2x2, big tile with small ones, side by side) with smooth cross-fades
+- **Shape-aware layouts**: The next few photos and clips load ahead, and each collage uses a layout whose tiles match their real shapes, so landscape shots land in wide tiles and portraits in tall ones. A photo that suits nothing else is shown on its own over a blurred backdrop
 - **Face-aware cropping**: Detects faces and positions each crop so they stay in view. People who appear often in your library are found automatically and kept on screen first; when nothing fits, the photo is letterboxed instead of cutting a face
-- **Video support**: Plays MP4 clips inline, with configurable max file size
+- **Video support**: Plays MP4 clips inline, placed by their real orientation, at most one per collage, with configurable max file size
 - **HEIC/HEIF support**: Processes Apple HEIC photos automatically via pillow-heif
 - **Image caching**: EXIF-corrected, resized to 1080x1920, compressed JPEG cache for instant loads
 - **Weather overlay**: Live weather from Open-Meteo with configurable location and temperature offset
@@ -157,6 +157,8 @@ app/
 ├── ha.py           # Home Assistant helpers (motion, status, parallel fetch)
 ├── upload.py       # Upload blueprint (dedup, ZIP, optional auth)
 ├── routes.py       # Main routes blueprint (frame, img, media, motion, etc.)
+├── static/
+│   └── collage.js  # Layout choice and per-tile fit (ES5, unit-tested under node)
 └── templates/
     ├── frame.html  # Slideshow display page
     └── upload.html # Upload form page

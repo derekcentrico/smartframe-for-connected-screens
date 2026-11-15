@@ -225,6 +225,7 @@
     </div>
   </div>
 
+<script src="{{ url_for('static', filename='collage.js') }}"></script>
 <script>
   // ES5 only
 
@@ -270,6 +271,8 @@
             currentIndex = 0;
           }
         } catch (e) { /* ignore parse error */ }
+        // Drop media queued from the old list, including failed loads.
+        resetPool();
         refreshFocus();
         hadServerError = false;
         recoveryInProgress = false;
@@ -298,35 +301,6 @@
     return f;
   }
 
-  // Layout set:
-  //   - Single full-screen
-  //   - Two stacked portrait tiles
-  //   - Big top + three small bottom
-  //   - Big left + two stacked right
-  var LAYOUTS = [
-    // Single full-screen (weighted twice)
-    { rows: "1fr", cols: "1fr", areas: [["a"]], tiles: ["a"] },
-    { rows: "1fr", cols: "1fr", areas: [["a"]], tiles: ["a"] },
-
-    // Two stacked (top/bottom)
-    { rows: "1fr 1fr", cols: "1fr", areas: [["a"],["b"]], tiles: ["a","b"] },
-    { rows: "1fr 1fr", cols: "1fr", areas: [["a"],["b"]], tiles: ["a","b"] },
-
-    // Big top, three small bottom
-    {
-      rows: "2fr 1fr", cols: "1fr 1fr 1fr",
-      areas: [["a","a","a"],["b","c","d"]],
-      tiles: ["a","b","c","d"]
-    },
-
-    // Big left, two stacked right
-    {
-      rows: "1fr 1fr", cols: "2fr 1fr",
-      areas: [["a","b"],["a","c"]],
-      tiles: ["a","b","c"]
-    }
-  ];
-
   function refreshFocus() {
     var xhr = new XMLHttpRequest();
     xhr.open("GET", "/focus_map/" + encodeURIComponent(FRAME_NAME), true);
@@ -341,66 +315,237 @@
     xhr.send(null);
   }
 
-  function boxFits(box, vw, vh) {
-    return box && box[2] <= vw + 0.001 && box[3] <= vh + 0.001;
+  // ---- Lookahead pool ----
+  // A few items load ahead so the layout is chosen from real dimensions
+  // (collage.js) before anything is placed. Entries stay in playlist order and
+  // the oldest is always shown next, so nothing waits more than POOL_SIZE
+  // collages.
+  var POOL_SIZE       = 5;
+  var LOAD_TIMEOUT_MS = 20000;
+  var BUILD_WAIT_MS   = 4000;
+  var pool            = [];  // {url, video, el, w, h, ready, done, timer}
+  var poolGen         = 0;   // bumped on reset; stale callbacks compare against it
+  var poolWaiters     = [];
+  var building        = false;
+  var lastLayoutName  = null;
+
+  function inPool(url) {
+    for (var i = 0; i < pool.length; i++) {
+      if (pool[i].url === url) return true;
+    }
+    return false;
   }
 
-  // object-position that centres box inside the visible window of a cover
-  // crop. vw/vh are the visible fraction of the image on each axis.
-  function coverPosition(box, vw, vh) {
-    var px = 50, py = 50;
-    if (vw < 0.999) {
-      var left = Math.min(Math.max(box[0] + box[2] / 2 - vw / 2, 0), 1 - vw);
-      px = left / (1 - vw) * 100;
+  function pendingCount() {
+    var n = 0;
+    for (var i = 0; i < pool.length; i++) {
+      if (!pool[i].done) n++;
     }
-    if (vh < 0.999) {
-      var top = Math.min(Math.max(box[1] + box[3] / 2 - vh / 2, 0), 1 - vh);
-      py = top / (1 - vh) * 100;
-    }
-    return px.toFixed(1) + "% " + py.toFixed(1) + "%";
+    return n;
   }
 
-  // Must run once the tile is in the document; a detached tile measures 0x0.
-  function fitImage(img, isSingleLayout) {
-    img.style.objectFit = "cover";
-    img.style.objectPosition = "50% 50%";
-    var tile = img.parentNode;
-    if (!tile) return;
-    var rect = tile.getBoundingClientRect();
-    var iw = img.naturalWidth, ih = img.naturalHeight;
-    if (!rect.width || !rect.height || !iw || !ih) return;
+  // Drop the source so a stalled request frees its connection and a detached
+  // video frees its decoder.
+  function releaseMedia(el) {
+    if (!el) return;
+    el.onload = el.onerror = el.onloadeddata = null;
+    if (el.tagName === "VIDEO") {
+      try { el.pause(); } catch (e) { /* already stopped */ }
+    }
+    el.removeAttribute("src");
+    if (el.tagName === "VIDEO") {
+      try { el.load(); } catch (e) { /* nothing to unload */ }
+    }
+  }
 
-    if (isSingleLayout) {
-      var tileAR = rect.width / rect.height;
-      var imgAR  = iw / ih;
-      var ratio = (imgAR > tileAR) ? (imgAR / tileAR) : (tileAR / imgAR);
-      // Aspect ratios differ by > ~35%: show the full image with bars.
-      if (ratio > 1.35) {
-        img.style.objectFit = "contain";
-        return;
+  function poolHasVideo() {
+    for (var i = 0; i < pool.length; i++) {
+      if (pool[i].video) return true;
+    }
+    return false;
+  }
+
+  function poolHasReady() {
+    for (var i = 0; i < pool.length; i++) {
+      if (pool[i].ready) return true;
+    }
+    return false;
+  }
+
+  function flushWaiters() {
+    var waiting = poolWaiters;
+    poolWaiters = [];
+    for (var i = 0; i < waiting.length; i++) waiting[i]();
+  }
+
+  function settle(entry, gen, ok, w, h) {
+    if (entry.done || gen !== poolGen) return;
+    entry.done = true;
+    clearTimeout(entry.timer);
+    if (ok && w && h) {
+      entry.ready = true;
+      entry.w = w;
+      entry.h = h;
+    } else {
+      for (var i = 0; i < pool.length; i++) {
+        if (pool[i] === entry) { pool.splice(i, 1); break; }
+      }
+      releaseMedia(entry.el);
+    }
+    if (!pendingCount()) flushWaiters();
+  }
+
+  function loadEntry(entry, gen) {
+    var el;
+    if (entry.video) {
+      el = document.createElement("video");
+      el.muted = true;
+      el.loop = true;
+      el.preload = "auto";
+      el.setAttribute("muted", "");
+      el.setAttribute("playsinline", "");
+      // Wait for a decodable frame: metadata alone can precede a broken stream.
+      el.onloadeddata = function() { settle(entry, gen, true, el.videoWidth, el.videoHeight); };
+      el.onerror = function() { settle(entry, gen, false); };
+    } else {
+      el = document.createElement("img");
+      el.setAttribute("data-src", entry.url);
+      el.onload = function() { settle(entry, gen, true, el.naturalWidth, el.naturalHeight); };
+      el.onerror = function() { settle(entry, gen, false); };
+    }
+    entry.el = el;
+    entry.timer = setTimeout(function() { settle(entry, gen, false); }, LOAD_TIMEOUT_MS);
+    el.src = entry.url;
+  }
+
+  // Top the pool up. cb, if given, runs once nothing is still loading.
+  function fillPool(cb) {
+    if (cb) poolWaiters.push(cb);
+    var want = Math.min(POOL_SIZE, ALL_FILES.length);
+    var tries = 0;
+    while (pool.length < want && tries < ALL_FILES.length) {
+      tries++;
+      var url = nextFile();
+      if (!url || inPool(url)) continue;
+      if (isVideo(url) && poolHasVideo()) {
+        // One clip buffers at a time; this one keeps its place in the queue.
+        currentIndex = (currentIndex - 1 + ALL_FILES.length) % ALL_FILES.length;
+        break;
+      }
+      var entry = { url: url, video: isVideo(url), ready: false, done: false };
+      pool.push(entry);
+      loadEntry(entry, poolGen);
+    }
+    if (!pendingCount()) flushWaiters();
+  }
+
+  function resetPool() {
+    poolGen++;
+    for (var i = 0; i < pool.length; i++) {
+      clearTimeout(pool[i].timer);
+      releaseMedia(pool[i].el);
+    }
+    pool = [];
+    poolWaiters = [];
+    building = false;
+  }
+
+  // Letterboxed media shows the blurred backdrop in its bars, not black.
+  function applyFit(el, tile, fit) {
+    el.style.objectFit = fit.fit;
+    el.style.objectPosition = fit.pos;
+    var clear = fit.fit === "contain" ? "transparent" : "";
+    el.style.background = clear;
+    tile.style.background = clear;
+  }
+
+  function renderFromPool() {
+    var collage = document.getElementById("collage");
+    var bg      = document.getElementById("bg");
+    var Collage = window.SmartFrameCollage;
+
+    var ready = [];
+    for (var i = 0; i < pool.length; i++) {
+      if (pool[i].ready) ready.push(pool[i]);
+    }
+    if (!ready.length) {
+      // Every load failed: keep the last collage and show the badge.
+      markServerError();
+      return;
+    }
+
+    var items = [];
+    for (var j = 0; j < ready.length; j++) {
+      items.push({
+        w: ready[j].w,
+        h: ready[j].h,
+        video: ready[j].video,
+        focus: ready[j].video ? null : (FOCUS[ready[j].url] || null)
+      });
+    }
+
+    var cs  = window.getComputedStyle ? window.getComputedStyle(collage) : null;
+    var pad = cs ? (parseFloat(cs.paddingLeft) || 0) : 0;
+    var gap = cs ? (parseFloat(cs.columnGap || cs.gridColumnGap) || 0) : 0;
+    var plan = Collage.choose(items, collage.clientWidth, collage.clientHeight,
+                              pad, gap, lastLayoutName, Math.random);
+    if (!plan) return;
+
+    var oldVideos = [];
+    var vids = collage.getElementsByTagName("video");
+    for (var v = 0; v < vids.length; v++) oldVideos.push(vids[v]);
+    while (collage.firstChild) collage.removeChild(collage.firstChild);
+    for (var o = 0; o < oldVideos.length; o++) releaseMedia(oldVideos[o]);
+
+    collage.style.gridTemplateRows    = Collage.cssTracks(plan.layout.rows);
+    collage.style.gridTemplateColumns = Collage.cssTracks(plan.layout.cols);
+    collage.style.gridTemplateAreas   = Collage.cssAreas(plan.layout.areas);
+
+    var single = plan.tiles.length === 1;
+    var placed = [];
+    var firstImage = null;
+    for (var t = 0; t < plan.tiles.length; t++) {
+      var spec  = plan.tiles[t];
+      var entry = ready[spec.index];
+      var tile  = document.createElement("div");
+      tile.className = "tile fade-in";
+      tile.style.gridArea = spec.name;
+      applyFit(entry.el, tile, spec);
+      tile.appendChild(entry.el);
+      collage.appendChild(tile);
+      placed.push({ entry: entry, item: items[spec.index], tile: tile });
+      if (entry.video) {
+        entry.el.autoplay = true;
+        try {
+          var started = entry.el.play();
+          if (started && started["catch"]) started["catch"](function() { /* autoplay refused */ });
+        } catch (e) { /* old WebView without a play() promise */ }
+      } else if (!firstImage) {
+        firstImage = entry.url;
       }
     }
 
-    var focus = FOCUS[img.getAttribute("data-src")];
-    if (!focus) return;
-    var scale = Math.max(rect.width / iw, rect.height / ih);
-    var vw = rect.width / (iw * scale);
-    var vh = rect.height / (ih * scale);
-
-    // Prefer every clear face; settle for the frequent ones; otherwise
-    // letterbox rather than cut a face.
-    var target = boxFits(focus.a, vw, vh) ? focus.a
-               : (boxFits(focus.f, vw, vh) ? focus.f : null);
-    if (target) {
-      img.style.objectPosition = coverPosition(target, vw, vh);
-    } else {
-      img.style.objectFit = "contain";
+    // Recheck against the laid-out boxes in case the computed ones drifted.
+    for (var q = 0; q < placed.length; q++) {
+      var rect = placed[q].tile.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+      var fit = Collage.planFit(placed[q].item, rect.width, rect.height, single);
+      applyFit(placed[q].entry.el, placed[q].tile, fit);
     }
-  }
 
-  // Snapshot of last successfully rendered collage HTML + bg image
-  var lastGoodCollageHTML = "";
-  var lastGoodBgImage    = "";
+    var keep = [];
+    for (var k = 0; k < pool.length; k++) {
+      var shown = false;
+      for (var m = 0; m < placed.length; m++) {
+        if (placed[m].entry === pool[k]) { shown = true; break; }
+      }
+      if (!shown) keep.push(pool[k]);
+    }
+    pool = keep;
+
+    if (firstImage && bg) bg.style.backgroundImage = "url('" + firstImage + "')";
+    lastLayoutName = plan.layout.name;
+  }
 
   function buildCollage() {
     var collage = document.getElementById("collage");
@@ -411,101 +556,21 @@
       if (bg) bg.style.backgroundImage = "none";
       return;
     }
-
-    var layout = LAYOUTS[Math.floor(Math.random() * LAYOUTS.length)];
-    var isSingleLayout = (layout.tiles.length === 1);
-
-    // Build new collage in a detached container so we can verify loads before swapping
-    var tempContainer = document.createElement("div");
-
-    tempContainer.style.gridTemplateRows    = layout.rows;
-    tempContainer.style.gridTemplateColumns = layout.cols;
-    var rowsCss = [];
-    for (var r = 0; r < layout.areas.length; r++) {
-      rowsCss.push("'" + layout.areas[r].join(" ") + "'");
+    if (building) return;
+    building = true;
+    var gen = poolGen;
+    var started = false;
+    function go() {
+      if (started || gen !== poolGen) return;
+      started = true;
+      building = false;
+      renderFromPool();
+      // Load the next collage's media during this one's display time.
+      fillPool(null);
     }
-    tempContainer.style.gridTemplateAreas = rowsCss.join(" ");
-
-    var firstImageForBg = null;
-    var totalTiles  = layout.tiles.length;
-    var loadedCount = 0;
-    var failedCount = 0;
-
-    function checkAllLoaded() {
-      if (loadedCount + failedCount < totalTiles) return;
-      if (failedCount === totalTiles) {
-        // All tiles failed, keep showing last-good content
-        markServerError();
-        return;
-      }
-      // At least some tiles loaded, swap in the new collage
-      while (collage.firstChild) collage.removeChild(collage.firstChild);
-      collage.style.gridTemplateRows    = tempContainer.style.gridTemplateRows;
-      collage.style.gridTemplateColumns = tempContainer.style.gridTemplateColumns;
-      collage.style.gridTemplateAreas   = tempContainer.style.gridTemplateAreas;
-      while (tempContainer.firstChild) collage.appendChild(tempContainer.firstChild);
-
-      var imgs = collage.getElementsByTagName("img");
-      for (var k = 0; k < imgs.length; k++) fitImage(imgs[k], isSingleLayout);
-
-      if (firstImageForBg && bg) {
-        bg.style.backgroundImage = "url('" + firstImageForBg + "')";
-        lastGoodBgImage = bg.style.backgroundImage;
-      }
-      lastGoodCollageHTML = collage.innerHTML;
-    }
-
-    for (var i = 0; i < layout.tiles.length; i++) {
-      var areaName = layout.tiles[i];
-      var file     = nextFile();
-      if (!file) { failedCount++; continue; }
-
-      var tile = document.createElement("div");
-      tile.className = "tile fade-in";
-      tile.style.gridArea = areaName;
-
-      var el;
-      if (isVideo(file)) {
-        el = document.createElement("video");
-        el.autoplay = true;
-        el.loop     = true;
-        el.muted    = true;
-        if (isSingleLayout) {
-          el.style.objectFit = "contain";
-        } else {
-          el.style.objectFit = "cover";
-        }
-        el.src = file;
-        // Videos: count as loaded once metadata arrives
-        (function(tileRef) {
-          el.onloadeddata = function() { loadedCount++; checkAllLoaded(); };
-          el.onerror = function() {
-            tileRef.style.display = "none";
-            failedCount++;
-            checkAllLoaded();
-          };
-        })(tile);
-      } else {
-        el = document.createElement("img");
-        el.setAttribute("data-src", file);
-        (function(imgRef, tileRef){
-          imgRef.onload = function() {
-            loadedCount++;
-            checkAllLoaded();
-          };
-          imgRef.onerror = function() {
-            tileRef.style.display = "none";
-            failedCount++;
-            checkAllLoaded();
-          };
-        })(el, tile);
-        el.src = file;
-        if (!firstImageForBg) firstImageForBg = file;
-      }
-
-      tile.appendChild(el);
-      tempContainer.appendChild(tile);
-    }
+    fillPool(go);
+    // A stalled request must not hold back media that is already loaded.
+    setTimeout(function() { if (poolHasReady()) go(); }, BUILD_WAIT_MS);
   }
 
   function startSlideshow() {
